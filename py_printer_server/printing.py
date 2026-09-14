@@ -9,7 +9,6 @@ from __future__ import annotations
 import ctypes
 import json
 import logging
-import os
 import queue
 import shutil
 import threading
@@ -66,106 +65,85 @@ class Job:
     files: list[JobFile]
     options: PrintOptions
     created: float = field(default_factory=time.time)
-    status: str = "queued"  # queued | printing | done | error
+    # queued | printing | done | partial | unsupported | error
+    status: str = "queued"
     finished: float | None = None
+    error: str = ""
 
 
-class _DevmodeGuard:
-    """Context manager that applies print options to a printer's devmode and
-    restores the previous devmode on exit, including on an exception.
+class PrinterSession:
+    """An open printer handle plus a per-job DEVMODE built from PrintOptions.
 
-    The Win32 devmode is effectively global per-printer while it is set: two
-    concurrent jobs on the same printer would fight over it if this were not
-    serialised, which is why the caller (JobQueue) only ever runs one job at a
-    time. A crash between apply and restore would otherwise leave the user's
-    printer stuck on whatever the last job requested (e.g. permanently mono),
-    so restoration happens in `__exit__`, not at the end of the happy path.
+    Per-job, deliberately. The intuitive approach -- GetPrinterW, edit the
+    devmode, SetPrinterW -- was what an earlier version of this file did, and
+    it is wrong twice over: it needs the "Manage this printer" permission that
+    an ordinary user does not have (ERROR_ACCESS_DENIED), and even with rights
+    it rewrites the printer's *global* defaults, so one web request would
+    change what every other application on the machine prints. Building the
+    devmode with DocumentPropertiesW instead needs no privileges and touches
+    nothing outside this document, which also means there is no global state
+    to restore afterwards and no window in which a crash could strand the
+    printer in mono.
     """
 
     def __init__(self, printer_name: str, options: PrintOptions):
         self._printer_name = printer_name
         self._options = options
         self._handle = None
-        self._previous_devmode_bytes: bytes | None = None
+        self.devmode = None
+        self._devmode_buf = None
 
-    def __enter__(self) -> None:
-        self._handle = winspool.open_printer(self._printer_name, winspool.PRINTER_ALL_ACCESS)
-        current = self._get_devmode()
-        self._previous_devmode_bytes = bytes(current)
-        self._apply(current)
-        self._set_devmode(current)
+    def __enter__(self) -> "PrinterSession":
+        # __exit__ is NOT called when __enter__ raises, so anything acquired
+        # here must be released on the failure path explicitly or it leaks for
+        # the life of the (long-lived) worker thread.
+        self._handle = winspool.open_printer(self._printer_name, winspool.PRINTER_ACCESS_USE)
+        try:
+            self.devmode, self._devmode_buf = winspool.build_job_devmode(
+                self._handle, self._printer_name, self._apply
+            )
+        except BaseException:
+            self._close()
+            raise
+        return self
 
     def __exit__(self, exc_type, exc, tb) -> None:
-        try:
-            if self._previous_devmode_bytes is not None and self._handle:
-                restored = winspool.DEVMODEW.from_buffer_copy(self._previous_devmode_bytes)
-                try:
-                    self._set_devmode(restored)
-                except winspool.WinspoolError:
-                    logger.exception("failed to restore devmode for %s", self._printer_name)
-        finally:
-            if self._handle:
-                winspool.close_printer(self._handle)
-                self._handle = None
+        self._close()
 
-    def _get_devmode(self) -> winspool.DEVMODEW:
-        needed = c_ulong(0)
-        ok = winspool.winspool.GetPrinterW(self._handle, 2, None, 0, byref(needed))
-        if not ok and get_last_error() != winspool.ERROR_INSUFFICIENT_BUFFER:
-            raise winspool.WinspoolError(f"GetPrinterW sizing failed: {get_last_error()}")
-        buf = create_string_buffer(needed.value)
-        ok = winspool.winspool.GetPrinterW(self._handle, 2, buf, needed.value, byref(needed))
-        if not ok:
-            raise winspool.WinspoolError(f"GetPrinterW failed: {get_last_error()}")
-        info = cast(buf, ctypes.POINTER(winspool.PRINTER_INFO_2W)).contents
-        if not info.pDevMode:
-            raise winspool.WinspoolError(f"printer {self._printer_name!r} returned no DEVMODE")
-        # Copy the DEVMODEW out of the PRINTER_INFO_2W buffer immediately: the
-        # `buf` bytes here go out of scope at the end of this method, and (as
-        # with EnumPrintersW) a struct's embedded pointer is only valid while
-        # its backing buffer is alive.
-        return winspool.DEVMODEW.from_buffer_copy(info.pDevMode.contents)
+    @property
+    def handle(self):
+        return self._handle
+
+    def _close(self) -> None:
+        self.devmode = None
+        self._devmode_buf = None
+        if self._handle:
+            winspool.close_printer(self._handle)
+            self._handle = None
 
     def _apply(self, dm: winspool.DEVMODEW) -> None:
         opts = self._options
         dm.dmColor = winspool.DMCOLOR_COLOR if opts.color else winspool.DMCOLOR_MONOCHROME
-        dm.dmPaperSize = winspool.DMPAPER_A4 if opts.paper.upper() == "A4" else dm.dmPaperSize
+        if opts.paper.upper() == "A4":
+            dm.dmPaperSize = winspool.DMPAPER_A4
+        # dmCopies is the ONLY place copies are applied. print_text must not
+        # also loop its pages, or the two multiply: an earlier version did
+        # both, so 3 copies of a 2-page file emitted 18 pages.
         dm.dmCopies = max(1, opts.copies)
         dm.dmDuplex = winspool.DMDUP_VERTICAL if opts.duplex else winspool.DMDUP_SIMPLEX
-        # dmFields is the trap: a field written above without its bit set
-        # here is silently ignored by the driver. OR in, never overwrite, so
-        # any bits the driver already had set for fields we do not touch
-        # survive.
+        # dmFields is the trap: a field written above without its bit set here
+        # is silently ignored by the driver. OR in, never overwrite, so bits
+        # the driver already set for fields we do not touch survive.
         dm.dmFields |= (
             winspool.DM_COLOR | winspool.DM_PAPERSIZE | winspool.DM_COPIES | winspool.DM_DUPLEX
         )
 
-    def _set_devmode(self, dm: winspool.DEVMODEW) -> None:
-        info = winspool.PRINTER_INFO_2W()
-        # SetPrinterW(level=2) with only pDevMode populated updates just the
-        # devmode; every other pointer field must stay NULL or the call
-        # attempts to rewrite fields we never read, which can fail or (worse)
-        # silently blank them.
-        ctypes.memset(byref(info), 0, ctypes.sizeof(info))
-        info.pDevMode = ctypes.pointer(dm)
-        ok = winspool.winspool.SetPrinterW(self._handle, 2, byref(info), 0)
-        if not ok:
-            raise winspool.WinspoolError(f"SetPrinterW failed: {get_last_error()}")
 
+def paginate_text(text: str) -> list[str]:
+    """Wrap and paginate plain text into fixed-size pages.
 
-def print_text(src: Path, options: PrintOptions) -> None:
-    """Print a plain text file by writing it straight to the spooler.
-
-    This is the one path we fully control: pagination, line wrapping and
-    the raw bytes sent are all ours, so this is also the path where
-    colour/mono, copies and duplex are guaranteed to apply exactly as
-    requested (via the devmode set on the printer before StartDocPrinterW).
+    Pure function, so the pagination can be tested without a printer.
     """
-    try:
-        text = src.read_text(encoding="utf-8", errors="replace")
-    except OSError as exc:
-        raise PrintError(f"cannot read {src.name}: {exc}") from exc
-
     lines: list[str] = []
     for raw_line in text.splitlines() or [""]:
         if not raw_line:
@@ -178,62 +156,93 @@ def print_text(src: Path, options: PrintOptions) -> None:
     for i in range(0, len(lines), TEXT_LINES_PER_PAGE):
         page_lines = lines[i:i + TEXT_LINES_PER_PAGE]
         pages.append("\r\n".join(page_lines) + "\r\n\f")
+    return pages or ["\f"]
 
-    handle = winspool.open_printer(options.printer, winspool.PRINTER_ALL_ACCESS)
+
+def print_text(src: Path, session: "PrinterSession") -> None:
+    """Print a plain text file by writing it through the spooler.
+
+    Copies are NOT looped here: the session's devmode already carries
+    dmCopies, and doing both multiplies them.
+
+    The document datatype is ``TEXT``, not ``RAW``. RAW means "these bytes are
+    already in the printer's own language" -- sending plain text as RAW to a
+    PCL or host-based inkjet prints nothing, or pages of garbage. TEXT asks the
+    spooler's print processor to render the characters for the device. For the
+    same reason the bytes are encoded as cp1252 rather than UTF-8: the TEXT
+    processor expects an ANSI code page, and a UTF-8 multi-byte sequence would
+    arrive as mojibake.
+    """
     try:
-        doc_info = winspool.DOC_INFO_1W(pDocName=src.name, pOutputFile=None, pDatatype="RAW")
-        job_id = winspool.winspool.StartDocPrinterW(handle, 1, byref(doc_info))
-        if not job_id:
-            raise winspool.WinspoolError(f"StartDocPrinterW failed: {get_last_error()}")
-        try:
-            for _ in range(max(1, options.copies)):
-                for page in pages:
-                    if not winspool.winspool.StartPagePrinter(handle):
-                        raise winspool.WinspoolError(f"StartPagePrinter failed: {get_last_error()}")
-                    try:
-                        data = page.encode("utf-8", errors="replace")
-                        written = c_ulong(0)
-                        buf = create_string_buffer(data, len(data))
-                        if not winspool.winspool.WritePrinter(handle, buf, len(data), byref(written)):
-                            raise winspool.WinspoolError(f"WritePrinter failed: {get_last_error()}")
-                    finally:
-                        winspool.winspool.EndPagePrinter(handle)
-        finally:
-            winspool.winspool.EndDocPrinter(handle)
+        text = src.read_text(encoding="utf-8", errors="replace")
+    except OSError as exc:
+        raise PrintError(f"cannot read {src.name}: {exc}") from exc
+
+    pages = paginate_text(text)
+    handle = session.handle
+
+    doc_info = winspool.DOC_INFO_1W(pDocName=src.name, pOutputFile=None, pDatatype="TEXT")
+    job_id = winspool.winspool.StartDocPrinterW(handle, 1, byref(doc_info))
+    if not job_id:
+        raise winspool.WinspoolError(
+            f"StartDocPrinterW failed for {src.name}: {get_last_error()}"
+        )
+    try:
+        for page in pages:
+            if not winspool.winspool.StartPagePrinter(handle):
+                raise winspool.WinspoolError(f"StartPagePrinter failed: {get_last_error()}")
+            try:
+                data = page.encode("cp1252", errors="replace")
+                written = c_ulong(0)
+                buf = create_string_buffer(data, len(data))
+                if not winspool.winspool.WritePrinter(handle, buf, len(data), byref(written)):
+                    raise winspool.WinspoolError(f"WritePrinter failed: {get_last_error()}")
+                if written.value != len(data):
+                    raise winspool.WinspoolError(
+                        f"WritePrinter wrote {written.value} of {len(data)} bytes"
+                    )
+            finally:
+                winspool.winspool.EndPagePrinter(handle)
     finally:
-        winspool.close_printer(handle)
+        winspool.winspool.EndDocPrinter(handle)
 
 
 def print_via_shell(src: Path, options: PrintOptions) -> None:
-    """Print via the shell's ``printto`` verb, with the devmode applied first.
+    """Print via the shell's ``printto`` verb.
 
     Fire-and-forget: this returns once the associated application has been
-    launched to print, not once the page has actually come out. Job
-    completion is observed separately by polling EnumJobsW (see
-    JobQueue._process_one), because the shell call itself reports nothing
-    beyond "a handler was found and started".
+    launched to print, not once the page has actually come out. Job completion
+    is observed separately by polling EnumJobsW (see JobQueue._process_one),
+    because the shell call itself reports nothing beyond "a handler was found
+    and started".
+
+    Note this path cannot carry our per-job devmode: the handler builds its
+    own. Colour/duplex/copies therefore follow the printer's standing defaults
+    for PDFs, images and Office documents -- a real limitation, surfaced to the
+    user rather than silently ignored.
     """
     code = winspool.shell_print_to(options.printer, str(src))
     if code <= 32:
         raise PrintError(
-            f"no registered handler could print {src.name} "
-            f"(ShellExecute error code {code})"
+            f"no program on this PC could print {src.name} "
+            f"(ShellExecute error code {code}"
+            + (", no application is associated with this file type"
+               if code == winspool.SE_ERR_NOASSOC else "")
+            + ")"
         )
 
 
 class JobQueue:
     """Single-worker print queue.
 
-    One worker thread, so two phones uploading and printing at the same time
-    do not interleave devmode changes on the same printer -- the devmode is
-    briefly a global setting while a shell-verb job is in flight, and this is
-    what keeps that window safe.
+    One worker thread, so two phones printing at the same time cannot
+    interleave their spooler calls on the same printer handle.
     """
 
     def __init__(self, jobs_dir: Path, dry_run: bool = False):
         self.jobs_dir = jobs_dir
         self.dry_run = dry_run
-        self._queue: queue.Queue[Job] = queue.Queue()
+        self._queue: queue.Queue[tuple[Job, Path]] = queue.Queue()
         self._jobs: dict[str, Job] = {}
         self._lock = threading.Lock()
         self._worker = threading.Thread(target=self._run, daemon=True, name="print-worker")
@@ -259,31 +268,72 @@ class JobQueue:
 
     def _run(self) -> None:
         while True:
-            job, spool_dir = self._queue.get()
+            # Everything, including the unpack, sits inside the try: an
+            # exception escaping this loop would kill the only worker thread
+            # for the life of the process, after which every submitted job
+            # would sit at "queued" forever with nothing logged.
+            item = None
             try:
+                item = self._queue.get()
+                job, spool_dir = item
                 self._process(job, spool_dir)
             except Exception:
-                logger.exception("unhandled error processing job %s", job.id)
-                job.status = "error"
-                job.finished = time.time()
+                job_id = getattr(item[0], "id", "<unknown>") if isinstance(item, tuple) and item else "<unknown>"
+                logger.exception("unhandled error processing job %s", job_id)
+                if isinstance(item, tuple) and item and isinstance(item[0], Job):
+                    failed = item[0]
+                    failed.status = "error"
+                    if not failed.error:
+                        failed.error = "internal error; see the server log"
+                    for jf in failed.files:
+                        if jf.status in ("queued", "printing"):
+                            jf.status = "error"
+                            jf.detail = jf.detail or "job aborted"
+                    failed.finished = time.time()
 
     def _process(self, job: Job, spool_dir: Path) -> None:
         job.status = "printing"
-        # Every route runs under the same devmode guard: RAW_TEXT jobs still
-        # benefit from it (copies/duplex/color are applied by the printer
-        # itself as it renders the raw data), and SHELL_VERB jobs need it
-        # applied before the handler launches.
         try:
             if self.dry_run:
                 self._process_dry_run(job, spool_dir)
             else:
-                with _DevmodeGuard(job.options.printer, job.options):
+                with PrinterSession(job.options.printer, job.options) as session:
                     for jf in job.files:
-                        self._process_one(job, spool_dir, jf)
+                        self._process_one(job, spool_dir, jf, session)
+        except (PrintError, winspool.WinspoolError, OSError) as exc:
+            # A failure opening the printer or building the devmode happens
+            # before any file is touched. Without marking the files here they
+            # would still read "queued", and the status rule below would then
+            # call a job that never reached the printer a success.
+            job.error = str(exc)
+            for jf in job.files:
+                if jf.status in ("queued", "printing"):
+                    jf.status = "error"
+                    jf.detail = str(exc)
+            logger.warning("job %s failed before printing: %s", job.id, exc)
         finally:
-            job.status = "error" if any(f.status == "error" for f in job.files) else "done"
+            job.status = self._overall_status(job)
             job.finished = time.time()
             self._archive(job, spool_dir)
+
+    @staticmethod
+    def _overall_status(job: Job) -> str:
+        """Derive the job's status from its files, erring towards honesty.
+
+        Anything that is not an outright success makes the job non-"done": a
+        job reported as done must mean paper actually came out. An earlier
+        version only checked for "error", so a job whose files were all
+        "unsupported" -- or all still "queued" after an early failure --
+        reported DONE while printing nothing.
+        """
+        statuses = {f.status for f in job.files}
+        if not statuses or statuses == {"done"}:
+            return "done"
+        if "error" in statuses or "queued" in statuses or "printing" in statuses:
+            return "error"
+        if statuses == {"unsupported"}:
+            return "unsupported"
+        return "partial"
 
     def _process_dry_run(self, job: Job, spool_dir: Path) -> None:
         for jf in job.files:
@@ -297,53 +347,58 @@ class JobQueue:
             jf.status = "done" if decision.route != PrintRoute.UNSUPPORTED else "unsupported"
             jf.detail = decision.reason
 
-    def _process_one(self, job: Job, spool_dir: Path, jf: JobFile) -> None:
+    def _process_one(self, job: Job, spool_dir: Path, jf: JobFile, session: "PrinterSession") -> None:
         src = spool_dir / jf.name
+        if not src.is_file():
+            jf.status = "error"
+            jf.detail = "file is no longer in the spool"
+            return
         decision = route(src)
         if decision.route == PrintRoute.UNSUPPORTED:
             jf.status = "unsupported"
             jf.detail = decision.reason
             return
         try:
-            submitted_after = time.time()
             if decision.route == PrintRoute.RAW_TEXT:
-                print_text(src, job.options)
+                print_text(src, session)
             else:
+                queue_before = self._enum_jobs(job.options.printer)
                 print_via_shell(src, job.options)
-                self._wait_for_shell_job(job.options.printer, src.name, submitted_after)
+                self._wait_for_shell_job(job.options.printer, src.name, queue_before)
             jf.status = "done"
-        except (PrintError, winspool.WinspoolError) as exc:
+        except (PrintError, winspool.WinspoolError, OSError) as exc:
             jf.status = "error"
             jf.detail = str(exc)
             logger.warning("print failed for %s: %s", jf.name, exc)
 
-    def _wait_for_shell_job(self, printer: str, doc_name: str, submitted_after: float) -> None:
-        """Best-effort wait for a shell-verb job to leave the spooler queue.
+    def _wait_for_shell_job(self, printer: str, doc_name: str, queue_before: list[str]) -> None:
+        """Best-effort wait for a shell-launched job to drain from the queue.
 
-        Neither ShellExecuteW nor the handler it launches reports a usable
-        job id back to us, so this matches on document name within the
-        printer's current job list. A job that never appears is logged, not
-        raised -- the file may still have printed correctly with a handler
-        that renames the job, so treat "not observed" as inconclusive rather
-        than as a failure.
+        Neither ShellExecuteW nor the handler it launches reports a usable job
+        id, so this watches the queue as a whole rather than trying to identify
+        "our" job by name: handlers routinely rename the spool document (Word
+        prefixes it, Acrobat may use a full path), so name matching misses the
+        job far more often than it finds it.
+
+        The rule is therefore: wait until the queue holds nothing beyond what
+        was already there before we launched, then return. Returning early when
+        the queue is already clear is correct and is the common case for a
+        fast, small document -- an earlier version required observing the job
+        present and then absent, so a job that came and went between two polls
+        was never seen and burned the entire timeout on every file.
         """
+        baseline = set(queue_before)
         deadline = time.time() + JOB_APPEAR_TIMEOUT
-        seen = False
         while time.time() < deadline:
-            jobs = self._enum_jobs(printer)
-            matching = [j for j in jobs if doc_name in j]
-            if matching:
-                seen = True
-            elif seen:
-                # It appeared and then left the queue: done.
+            current = set(self._enum_jobs(printer))
+            if not (current - baseline):
                 return
             time.sleep(JOB_POLL_INTERVAL)
-        if not seen:
-            logger.info(
-                "job for %s never appeared in %s's queue within %.0fs; "
-                "it may still have printed via a handler that renamed it",
-                doc_name, printer, JOB_APPEAR_TIMEOUT,
-            )
+        logger.info(
+            "queue for %s still busy %.0fs after launching %s; "
+            "not waiting further (the job may simply be large)",
+            printer, JOB_APPEAR_TIMEOUT, doc_name,
+        )
 
     def _enum_jobs(self, printer: str) -> list[str]:
         handle = winspool.open_printer(printer)
@@ -361,19 +416,36 @@ class JobQueue:
                 return []
             array_type = winspool.JOB_INFO_1W * returned.value
             array = cast(buf, ctypes.POINTER(array_type)).contents
+            # Reading .pDocument (a c_wchar_p field) makes ctypes copy the
+            # string into a Python str immediately, so these survive `buf`
+            # going out of scope. Do not change this to hand back the structs
+            # themselves -- their pointers would dangle, which is exactly the
+            # bug that produced garbage printer names from EnumPrintersW.
             return [j.pDocument for j in array if j.pDocument]
         finally:
             winspool.close_printer(handle)
 
     def _archive(self, job: Job, spool_dir: Path) -> None:
-        """Move every source file out of the spool into a per-job archive
-        folder, alongside a job.json recording the outcome. Printed files are
-        moved, not deleted, so a reprint does not require re-uploading."""
+        """Move successfully printed files into a per-job archive folder.
+
+        Only files with status "done" are moved. A file that errored or was
+        unsupported stays in the spool so the user can fix the problem and
+        retry it -- an earlier version archived everything, which meant a
+        failed file silently vanished from the listing and had to be
+        re-uploaded from the phone, the opposite of why files are moved
+        rather than deleted.
+        """
         stamp = datetime.fromtimestamp(job.created).strftime("%Y%m%d-%H%M%S")
         dest = self.jobs_dir / f"print-job-{stamp}-{job.id}"
-        dest.mkdir(parents=True, exist_ok=True)
+        try:
+            dest.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            logger.warning("could not create archive folder %s: %s", dest, exc)
+            return
 
         for jf in job.files:
+            if jf.status != "done":
+                continue
             src = spool_dir / jf.name
             if not src.exists():
                 continue
@@ -392,6 +464,7 @@ class JobQueue:
             "created": job.created,
             "finished": job.finished,
             "status": job.status,
+            "error": job.error,
             "options": job.options.to_dict(),
             "files": [asdict(f) for f in job.files],
         }

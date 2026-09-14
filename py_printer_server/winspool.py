@@ -15,13 +15,11 @@ ones, so non-ASCII printer and file names round-trip correctly.
 from __future__ import annotations
 
 import platform
-import sys
 from ctypes import (
     POINTER,
     Structure,
     WinError,
     byref,
-    c_char,
     c_int,
     c_long,
     c_short,
@@ -34,7 +32,6 @@ from ctypes import (
     get_last_error,
     sizeof,
 )
-from dataclasses import dataclass
 
 if platform.system() != "Windows":
     raise RuntimeError("py-printer-server requires Windows (uses ctypes bindings to winspool.drv)")
@@ -62,6 +59,16 @@ PRINTER_ALL_ACCESS = 0x000F000C  # STANDARD_RIGHTS_REQUIRED | ADMINISTER | USE
 
 DC_COLORDEVICE = 6
 DC_DUPLEX = 7
+
+# DocumentPropertiesW flags (wingdi.h). DM_OUT_BUFFER asks the driver to fill
+# our buffer with its current settings; DM_IN_BUFFER asks it to validate and
+# merge settings we supply.
+DM_UPDATE = 1
+DM_COPY = 2
+DM_PROMPT = 4
+DM_MODIFY = 8
+DM_OUT_BUFFER = DM_COPY
+DM_IN_BUFFER = DM_MODIFY
 
 DM_COLOR = 0x00000800
 DM_DUPLEX = 0x00001000
@@ -252,6 +259,11 @@ winspool.GetDefaultPrinterW.restype = c_int
 winspool.DeviceCapabilitiesW.argtypes = [c_wchar_p, c_wchar_p, c_ulong, c_wchar_p, POINTER(DEVMODEW)]
 winspool.DeviceCapabilitiesW.restype = c_int
 
+winspool.DocumentPropertiesW.argtypes = [
+    c_void_p, c_void_p, c_wchar_p, POINTER(DEVMODEW), POINTER(DEVMODEW), c_long
+]
+winspool.DocumentPropertiesW.restype = c_long
+
 winspool.StartDocPrinterW.argtypes = [c_void_p, c_ulong, POINTER(DOC_INFO_1W)]
 winspool.StartDocPrinterW.restype = c_int
 
@@ -282,30 +294,6 @@ def _check(ok: int, what: str) -> None:
     if not ok:
         err = get_last_error()
         raise WinspoolError(f"{what} failed (GetLastError={err}): {WinError(err)}")
-
-
-def _enum_buffer(fn, *fixed_args) -> bytes:
-    """Run the standard Win32 two-pass sizing idiom.
-
-    The first call is made with a NULL buffer to learn the required byte
-    count; the real data is only fetched on the second call, into a buffer of
-    that exact size. Skipping the first call's `ERROR_INSUFFICIENT_BUFFER`
-    check and just trusting the return value would make an empty result look
-    identical to "no printers installed".
-    """
-    needed = c_ulong(0)
-    returned = c_ulong(0)
-    ok = fn(*fixed_args, None, 0, byref(needed), byref(returned))
-    if not ok:
-        err = get_last_error()
-        if err != ERROR_INSUFFICIENT_BUFFER:
-            raise WinspoolError(f"sizing call failed (GetLastError={err}): {WinError(err)}")
-    if needed.value == 0:
-        return b""
-    buf = create_string_buffer(needed.value)
-    ok = fn(*fixed_args, buf, needed.value, byref(needed), byref(returned))
-    _check(ok, "enum buffer fetch")
-    return buf.raw, returned.value
 
 
 def enum_printers_raw(flags: int):
@@ -381,6 +369,56 @@ def open_printer(name: str, access: int = PRINTER_ACCESS_USE) -> c_void_p:
 def close_printer(handle: c_void_p) -> None:
     if handle:
         winspool.ClosePrinter(handle)
+
+
+def build_job_devmode(handle: c_void_p, printer_name: str, mutate) -> tuple:
+    """Build a per-job DEVMODE with `mutate` applied, changing nothing globally.
+
+    Returns ``(pointer_to_DEVMODEW, backing_buffer)``. The caller must keep the
+    backing buffer referenced for as long as the pointer is used.
+
+    This is the right way to set per-job print options. The obvious-looking
+    alternative -- GetPrinterW/SetPrinterW(level=2) -- changes the printer's
+    *global* default settings, which requires the "Manage this printer"
+    permission (it fails with ERROR_ACCESS_DENIED for an ordinary user) and
+    would leak one job's choices into every other application's printing.
+    DocumentPropertiesW needs no special rights and is scoped to the document
+    we are about to start.
+
+    The buffer is sized from the driver, never from ``sizeof(DEVMODEW)``: a
+    real driver appends private data after the public struct (measured at
+    15356 bytes for an HP inkjet against a 224-byte public struct), and
+    copying only the public part truncates settings the driver depends on.
+    """
+    size = winspool.DocumentPropertiesW(None, handle, printer_name, None, None, 0)
+    if size < 0:
+        raise WinspoolError(
+            f"DocumentPropertiesW size query failed for {printer_name!r}: {get_last_error()}"
+        )
+    buf = create_string_buffer(max(size, sizeof(DEVMODEW)))
+    dm = cast(buf, POINTER(DEVMODEW))
+
+    rc = winspool.DocumentPropertiesW(None, handle, printer_name, dm, None, DM_OUT_BUFFER)
+    if rc < 0:
+        raise WinspoolError(
+            f"DocumentPropertiesW could not read defaults for {printer_name!r}: {get_last_error()}"
+        )
+
+    mutate(dm.contents)
+
+    # Hand it back to the driver to validate and merge: a driver may clamp or
+    # refuse a setting its hardware does not support (e.g. duplex on a
+    # simplex-only device), and this is where that is resolved rather than at
+    # print time.
+    rc = winspool.DocumentPropertiesW(
+        None, handle, printer_name, dm, dm, DM_IN_BUFFER | DM_OUT_BUFFER
+    )
+    if rc < 0:
+        raise WinspoolError(
+            f"DocumentPropertiesW rejected the requested settings for {printer_name!r}: "
+            f"{get_last_error()}"
+        )
+    return dm, buf
 
 
 def device_capabilities(device: str, port: str, capability: int) -> int:
