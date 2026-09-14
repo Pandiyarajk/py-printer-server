@@ -1,5 +1,10 @@
 # py-printer-server
 
+[![PyPI](https://img.shields.io/pypi/v/py-printer-server)](https://pypi.org/project/py-printer-server/)
+[![Python versions](https://img.shields.io/pypi/pyversions/py-printer-server)](https://pypi.org/project/py-printer-server/)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+[![Dependencies: none](https://img.shields.io/badge/dependencies-none-brightgreen)](pyproject.toml)
+
 Remote print server for a USB-connected printer. Python 3.11+, no third-party
 dependencies. Runs on the machine your printer is plugged into; phones and
 laptops on the same network upload files to it and print them.
