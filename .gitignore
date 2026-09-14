@@ -1,0 +1,12 @@
+__pycache__/
+*.log
+dist/
+build/
+*.egg-info/
+spool/
+jobs/
+config.json
+
+# Temporary files
+SCRATCHPAD.md
+scratchpad/
