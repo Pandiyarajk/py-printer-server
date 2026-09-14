@@ -31,6 +31,27 @@ Remote print server for a USB-connected printer. This repo follows the
   check `dmFields` in `py_printer_server/winspool.py` first -- a devmode field
   written without its corresponding `dmFields` bit set is silently ignored by
   the driver, not by a bug in this code.
+- **Per-job settings go through `DocumentPropertiesW`, never
+  `SetPrinterW`.** `winspool.build_job_devmode` builds a DEVMODE scoped to one
+  document. Using `GetPrinterW`/`SetPrinterW(level=2)` instead -- which an
+  early version did -- is wrong twice: it needs the "Manage this printer"
+  right an ordinary user lacks, and it rewrites the printer's *global*
+  defaults, changing what every other app on the machine prints.
+- **Never size a DEVMODE buffer with `sizeof(DEVMODEW)`.** Drivers append
+  private data after the public struct (measured: 15356 bytes vs a 224-byte
+  public struct on an HP inkjet). Always take the size from
+  `DocumentPropertiesW`'s size query.
+- **Plain text prints with datatype `TEXT`, not `RAW`, encoded cp1252.** RAW
+  means "already in the printer's language"; sending plain text as RAW to a
+  PCL/host-based printer produces nothing or garbage.
+- **A job reported `done` must mean paper came out.** `JobQueue._overall_status`
+  deliberately treats `queued`, `unsupported` and mixed outcomes as not-done
+  (`error`/`partial`/`unsupported`), and only files with status `done` are
+  archived out of the spool -- failures stay so they can be retried.
+- **The page template is rendered with `str.format`**, so every literal brace
+  in its embedded CSS/JS must be doubled. A stray single brace raises at
+  request time, not import time, so the UI 500s while unit tests still pass.
+  `tests/test_server.py` renders both templates to catch this.
 - The full design rationale, trade-offs (no PDF rendering, no per-job
   duplex/colour control for Office files, why SumatraPDF and pywin32 were
   rejected) is in the plan file this repo was built from:

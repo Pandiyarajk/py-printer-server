@@ -66,6 +66,12 @@ open that from a phone on the same Wi-Fi, log in, and upload a file.
 3. Printed files are **moved**, not deleted, into
    `jobs\print-job-<timestamp>-<id>\`, alongside a `job.json` recording what
    was printed and how -- so nothing needs re-uploading to print again.
+   A file that failed or could not be printed **stays in the spool** so you
+   can retry it; only successfully printed files are archived.
+
+A job is reported `done` only when every file actually printed. A mixed result
+is `partial`, and the jobs panel shows the reason next to each file that did
+not print.
 
 Only real hardware printers are shown by default (a "Show all printers"
 checkbox reveals software sinks like Microsoft Print to PDF).
@@ -76,7 +82,13 @@ checkbox reveals software sinks like Microsoft Print to PDF).
 |---|---|
 | Plain text / code (`.txt .log .csv .md .py .json ...`) | Printed directly by this tool -- full control over colour, copies and duplex. |
 | PDF and images (`.pdf .png .jpg .tif .bmp .gif`) | Handed to Windows' registered handler for that file type via the shell's print verb. |
-| Office documents (`.docx .xlsx .pptx .doc .xls .ppt`) | Same shell handoff, via Word/Excel/PowerPoint. Per-job duplex/colour control is not available for these -- they print with the printer's standing defaults. |
+| Office documents (`.docx .xlsx .pptx .doc .xls .ppt`) | Same shell handoff, via Word/Excel/PowerPoint. |
+
+**Colour, copies and duplex apply fully only to the text path.** PDFs, images
+and Office documents are printed by whichever application Windows has
+associated with them, and that application builds its own print settings, so
+those files follow the printer's standing defaults instead. This is a real
+limitation of printing without a bundled renderer, not a bug.
 
 ## No third-party dependencies
 

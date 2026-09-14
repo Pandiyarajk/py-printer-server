@@ -28,7 +28,7 @@ import time
 from email.message import Message
 from http import cookies
 from pathlib import Path
-from urllib.parse import parse_qs, quote, unquote, urlparse
+from urllib.parse import parse_qs, unquote, urlparse
 
 from py_printer_server.config import Config
 
@@ -43,11 +43,27 @@ CHUNK = 1024 * 1024
 LOG_FILE = "print-server.log"
 LOG_MAX_BYTES = 5 * 1024 * 1024
 BACKUP_COUNT = 5
+# Cap for bodies that are never file uploads (login, print, delete). These
+# are small JSON/form posts; anything larger is a mistake or an attempt to
+# make the server buffer arbitrary memory.
+SMALL_BODY_LIMIT = 1024 * 1024
+
 SESSION_TTL = 8 * 3600
 MAX_FAILURES = 5
 LOCKOUT_SECONDS = 300
 
 ADMIN_PASSWORD_ENV = "ADMIN_PASSWORD"
+
+# The server's own files, which live in the spool dir but are not uploads.
+_HIDDEN_SPOOL_NAMES = frozenset({"config.json"})
+
+# Reserved DOS device names: opening one of these resolves to a device rather
+# than a file in the spool, regardless of the directory.
+_RESERVED_DEVICE_NAMES = frozenset(
+    {"CON", "PRN", "AUX", "NUL"}
+    | {f"COM{i}" for i in range(1, 10)}
+    | {f"LPT{i}" for i in range(1, 10)}
+)
 
 DISCONNECT_ERRORS = (
     ConnectionResetError,
@@ -256,7 +272,7 @@ class Handler(http.server.SimpleHTTPRequestHandler):
         POST /upload        — multipart upload into the spool
         POST /print         — submit selected spool files as a print job
         POST /delete        — remove a spool file without printing it
-        GET  /settings      — default print options (admin only)
+        GET  /settings      — current default print options (admin only)
         POST /settings      — save default print options (admin only)
     """
 
@@ -276,6 +292,18 @@ class Handler(http.server.SimpleHTTPRequestHandler):
         if not name or name in (".", ".."):
             return None
         if "/" in name or "\\" in name or os.path.basename(name) != name:
+            return None
+        # ':' would address an NTFS alternate data stream ("file.txt:hidden"),
+        # which contains no separator and survives basename() unchanged. The
+        # wildcards are rejected for the same reason: they are not valid in a
+        # real filename here, so their presence means the name did not come
+        # from our own listing.
+        if any(ch in name for ch in ':*?"<>|') or "\x00" in name:
+            return None
+        # Reserved DOS device names resolve to devices, not files, whatever
+        # directory they appear to be in.
+        stem = name.split(".")[0].upper()
+        if stem in _RESERVED_DEVICE_NAMES:
             return None
         full = os.path.normpath(os.path.join(SPOOL_DIR, name))
         base = os.path.normpath(SPOOL_DIR)
@@ -434,6 +462,14 @@ button {{ width: 100%; padding: 12px; border: none; background: var(--accent); b
         entries = []
         try:
             for name in sorted(os.listdir(SPOOL_DIR), key=str.lower):
+                # The spool also holds our own bookkeeping: the config file,
+                # the rotating log, and .upload_* files staged mid-request.
+                # None of those are things the user uploaded to print, and
+                # offering them would be confusing at best.
+                if name in _HIDDEN_SPOOL_NAMES or name.startswith(".upload_"):
+                    continue
+                if name == LOG_FILE or name.startswith(LOG_FILE + "."):
+                    continue
                 full = os.path.join(SPOOL_DIR, name)
                 if not os.path.isfile(full):
                     continue
@@ -497,7 +533,12 @@ button {{ width: 100%; padding: 12px; border: none; background: var(--accent); b
                 self.send_error(401)
                 return
             from py_printer_server.printers import list_printers
-            show_virtual = query.get("all", ["0"])[0] == "1"
+            # The query parameter is the per-request override (the UI's
+            # checkbox); the config key is the saved default when absent.
+            if "all" in query:
+                show_virtual = query["all"][0] == "1"
+            else:
+                show_virtual = Config.show_virtual_printers
             printers = list_printers(show_virtual=show_virtual)
             self.send_json([
                 {
@@ -507,6 +548,13 @@ button {{ width: 100%; padding: 12px; border: none; background: var(--accent); b
                 }
                 for p in printers
             ])
+            return
+
+        if request_path == "/settings":
+            if not self.is_admin():
+                self.send_error(401)
+                return
+            self.send_json(_current_settings())
             return
 
         if request_path == "/jobs":
@@ -540,16 +588,35 @@ button {{ width: 100%; padding: 12px; border: none; background: var(--accent); b
 
     def do_POST(self) -> None:
         request_path, _ = self.parse_path(self.path)
-        length = int(self.headers.get("Content-Length", 0))
         client_ip = self.client_address[0]
         content_type = self.headers.get("Content-Type", "")
 
+        # A client-supplied header must never reach int() unguarded: a
+        # malformed Content-Length would raise ValueError here, before any
+        # auth check, and return a 500 with a traceback in the log.
+        raw_length = self.headers.get("Content-Length", "0")
+        try:
+            length = int(raw_length)
+        except (TypeError, ValueError):
+            self.send_error_text(400, "Invalid Content-Length")
+            return
+        if length < 0:
+            self.send_error_text(400, "Invalid Content-Length")
+            return
+
         if request_path == "/login":
-            body = self.rfile.read(length)
+            # Cap the body before reading it. /login is the one route
+            # reachable without credentials, so an uncapped read here lets an
+            # anonymous client announce a multi-gigabyte body and have the
+            # server try to buffer it.
+            if length > SMALL_BODY_LIMIT:
+                self.send_error_text(413, "Request body too large")
+                return
             if rl_check(client_ip):
                 self.send_error_text(429, "Too many failed attempts. Try again later.")
                 return
-            post = parse_qs(body.decode(), keep_blank_values=True)
+            body = self._read_exactly(length)
+            post = parse_qs(body.decode("utf-8", errors="replace"), keep_blank_values=True)
             password = post.get("password", [""])[0]
             if secrets.compare_digest(password, _admin_password()):
                 rl_reset(client_ip)
@@ -568,12 +635,16 @@ button {{ width: 100%; padding: 12px; border: none; background: var(--accent); b
             self._handle_upload(length, content_type, client_ip)
             return
 
-        if request_path == "/print":
-            self._handle_print(length, client_ip)
-            return
-
-        if request_path == "/delete":
-            self._handle_delete(length, client_ip)
+        if request_path in ("/print", "/delete", "/settings"):
+            if length > SMALL_BODY_LIMIT:
+                self.send_error_text(413, "Request body too large")
+                return
+            if request_path == "/print":
+                self._handle_print(length, client_ip)
+            elif request_path == "/delete":
+                self._handle_delete(length, client_ip)
+            else:
+                self._handle_settings(length, client_ip)
             return
 
         self.send_error_text(400, "Bad request")
@@ -605,64 +676,68 @@ button {{ width: 100%; padding: 12px; border: none; background: var(--accent); b
             logger.debug("upload aborted by client before body was received")
             return
 
-        boundary_bytes = boundary.encode()
         tmp_files: list[tuple[str, str, int]] = []
         errors: list[str] = []
+        # Names claimed by earlier parts of THIS request. _dedupe_name only
+        # sees what is already on disk, and nothing is committed until the
+        # whole batch is parsed, so without this two parts named the same
+        # (two IMG_0001.JPG from different phone folders, say) would both
+        # resolve to the same name and the second would overwrite the first.
+        claimed: set[str] = set()
 
-        for part in body.split(b"--" + boundary_bytes):
-            if b'filename="' not in part:
-                continue
-            try:
-                header_raw, file_data = part.split(b"\r\n\r\n", 1)
-                file_data = file_data.rstrip(b"\r\n--")
-                filename = os.path.basename(
-                    header_raw.split(b'filename="')[1].split(b'"')[0]
-                    .decode("utf-8", errors="replace")
-                )
-            except (ValueError, IndexError):
-                errors.append("Malformed upload part")
-                continue
+        try:
+            for filename, file_data in _iter_multipart_files(body, boundary):
+                if filename is None:
+                    errors.append("Malformed upload part")
+                    continue
+                if not filename:
+                    continue
 
-            if not filename:
-                continue
+                err = Config.check_upload(filename, len(file_data))
+                if err:
+                    errors.append(f"{filename}: {err}")
+                    logger.info("UPLOAD_REJECTED ip=%s filename=%s reason=%s",
+                                client_ip, filename, err)
+                    continue
 
-            err = Config.check_upload(filename, len(file_data))
-            if err:
-                errors.append(f"{filename}: {err}")
-                logger.info("UPLOAD_REJECTED ip=%s filename=%s reason=%s", client_ip, filename, err)
-                continue
+                final_name = _dedupe_name(SPOOL_DIR, filename, claimed)
+                claimed.add(final_name.lower())
 
-            # Name collisions get a numbered suffix rather than overwriting
-            # someone else's upload -- several phones can drop files into the
-            # same spool.
-            final_name = _dedupe_name(SPOOL_DIR, filename)
-
-            fd, tmp_path = tempfile.mkstemp(dir=SPOOL_DIR, prefix=".upload_")
-            try:
-                with os.fdopen(fd, "wb") as f:
-                    f.write(file_data)
-            except OSError as exc:
+                fd, tmp_path = tempfile.mkstemp(dir=SPOOL_DIR, prefix=".upload_")
                 try:
-                    os.unlink(tmp_path)
-                except OSError:
-                    pass
-                errors.append(f"{filename}: write error ({exc})")
-                logger.warning("upload write failed for %s: %s", filename, exc)
-                continue
-            tmp_files.append((tmp_path, final_name, len(file_data)))
+                    with os.fdopen(fd, "wb") as f:
+                        f.write(file_data)
+                except OSError as exc:
+                    try:
+                        os.unlink(tmp_path)
+                    except OSError:
+                        pass
+                    errors.append(f"{filename}: write error ({exc})")
+                    logger.warning("upload write failed for %s: %s", filename, exc)
+                    continue
+                tmp_files.append((tmp_path, final_name, len(file_data)))
 
-        if errors and not tmp_files:
+            if errors and not tmp_files:
+                self.send_error_text(400, "\n".join(errors))
+                return
+
+            committed: list[tuple[str, int]] = []
+            for tmp_path, filename, size in tmp_files:
+                os.replace(tmp_path, os.path.join(SPOOL_DIR, filename))
+                committed.append((filename, size))
+            tmp_files = []  # all committed; nothing left to clean up
+            for filename, size in committed:
+                self.log_event("UPLOAD", client_ip, filename, size)
+        finally:
+            # Any staged file still here failed to commit (a locked
+            # destination, an antivirus hold). Without this they linger as
+            # .upload_* files in the spool, where the listing shows them as
+            # printable.
             for tmp_path, _, _ in tmp_files:
                 try:
                     os.unlink(tmp_path)
                 except OSError:
                     pass
-            self.send_error_text(400, "\n".join(errors))
-            return
-
-        for tmp_path, filename, size in tmp_files:
-            os.replace(tmp_path, os.path.join(SPOOL_DIR, filename))
-            self.log_event("UPLOAD", client_ip, filename, size)
 
         if errors:
             self.send_json({"ok": True, "warnings": errors}, status=207)
@@ -733,6 +808,63 @@ button {{ width: 100%; padding: 12px; border: none; background: var(--accent); b
         self.log_event("DELETE", client_ip, name, size)
         self.send_json({"ok": True})
 
+    def _handle_settings(self, length: int, client_ip: str) -> None:
+        """Persist default print options to config.json."""
+        if not self._validate_csrf():
+            self.send_error_text(403, "Invalid or missing CSRF token")
+            return
+        body = self._read_exactly(length)
+        try:
+            payload = json.loads(body.decode("utf-8"))
+        except (ValueError, UnicodeDecodeError):
+            self.send_error_text(400, "Invalid JSON body")
+            return
+        if not isinstance(payload, dict):
+            self.send_error_text(400, "Expected a JSON object")
+            return
+
+        updates: dict = {}
+        if "default_printer" in payload:
+            updates["default_printer"] = str(payload["default_printer"])
+        if "default_color" in payload:
+            updates["default_color"] = bool(payload["default_color"])
+        if "default_paper" in payload:
+            updates["default_paper"] = str(payload["default_paper"])
+        if "default_duplex" in payload:
+            updates["default_duplex"] = bool(payload["default_duplex"])
+        if "default_copies" in payload:
+            try:
+                copies = int(payload["default_copies"])
+            except (TypeError, ValueError):
+                self.send_error_text(400, "default_copies must be a number")
+                return
+            if not 1 <= copies <= 99:
+                self.send_error_text(400, "default_copies must be between 1 and 99")
+                return
+            updates["default_copies"] = copies
+        if "show_virtual_printers" in payload:
+            updates["show_virtual_printers"] = bool(payload["show_virtual_printers"])
+
+        if not updates:
+            self.send_error_text(400, "No recognised settings in request")
+            return
+
+        Config.update(**updates)
+        logger.info("SETTINGS ip=%s %s", client_ip,
+                    " ".join(f"{k}={v}" for k, v in sorted(updates.items())))
+        self.send_json({"ok": True, "settings": _current_settings()})
+
+
+def _current_settings() -> dict:
+    return {
+        "default_printer": Config.default_printer,
+        "default_color": Config.default_color,
+        "default_paper": Config.default_paper,
+        "default_duplex": Config.default_duplex,
+        "default_copies": Config.default_copies,
+        "show_virtual_printers": Config.show_virtual_printers,
+    }
+
 
 def _html_escape(text: str) -> str:
     return (
@@ -741,14 +873,54 @@ def _html_escape(text: str) -> str:
     )
 
 
-def _dedupe_name(directory: str, filename: str) -> str:
-    """Return `filename`, or a ` (2)`-suffixed variant if it already exists
-    in `directory`, so an upload never silently overwrites another user's
-    file with the same name."""
+def _iter_multipart_files(body: bytes, boundary: str):
+    """Yield ``(filename, data)`` for each file part in a multipart body.
+
+    Yields ``(None, b"")`` for a part that cannot be parsed, so the caller can
+    report it rather than silently dropping it.
+
+    The delimiter is ``CRLF + "--" + boundary``, and that leading CRLF belongs
+    to the delimiter, not to the file. Splitting on the full delimiter
+    therefore removes it automatically, which is the only way to get this
+    right: a file may legitimately end in CRLF itself, so stripping a trailing
+    CRLF after the fact cannot tell the two apart and eats a real byte pair.
+
+    Splitting on the *bare* boundary is also wrong -- it splits anywhere those
+    bytes occur inside a file's own content, truncating it.
+    """
+    delimiter = b"\r\n--" + boundary.encode()
+    # The opening delimiter has no leading CRLF; normalise by prepending one
+    # so every delimiter in the body has the same shape.
+    for part in (b"\r\n" + body).split(delimiter):
+        if not part or part.startswith(b"--"):
+            continue  # preamble, or the closing "--" delimiter
+        if b'filename="' not in part:
+            continue
+        try:
+            header_raw, file_data = part.split(b"\r\n\r\n", 1)
+            filename = os.path.basename(
+                header_raw.split(b'filename="')[1].split(b'"')[0]
+                .decode("utf-8", errors="replace")
+            )
+        except (ValueError, IndexError):
+            yield None, b""
+            continue
+        yield filename, file_data
+
+
+def _dedupe_name(directory: str, filename: str, claimed: set[str] | None = None) -> str:
+    """Return `filename`, or a ` (2)`-suffixed variant if it is already taken.
+
+    `claimed` holds names reserved earlier in the same upload batch but not
+    yet written to disk; without it, two parts with the same name in one
+    request both pass the on-disk check and the second overwrites the first.
+    Comparison is case-insensitive because the filesystem is.
+    """
+    taken = claimed or set()
     stem, ext = os.path.splitext(filename)
     candidate = filename
     counter = 2
-    while os.path.exists(os.path.join(directory, candidate)):
+    while os.path.exists(os.path.join(directory, candidate)) or candidate.lower() in taken:
         candidate = f"{stem} ({counter}){ext}"
         counter += 1
     return candidate
@@ -761,6 +933,7 @@ def _job_to_dict(job) -> dict:
         "status": job.status,
         "created": job.created,
         "finished": job.finished,
+        "error": job.error,
         "options": job.options.to_dict(),
         "files": [asdict(f) for f in job.files],
     }
@@ -828,6 +1001,8 @@ th {{ color: var(--text-muted); font-weight: 600; font-size: 12px; text-transfor
 .job-row {{ font-size: 13px; padding: 6px 0; border-bottom: 1px solid var(--border); }}
 .job-done {{ color: var(--success); }}
 .job-error {{ color: var(--danger); }}
+.job-warn {{ color: #f59e0b; }}
+.job-detail {{ font-size: 12px; color: var(--text-muted); margin-left: 8px; }}
 </style>
 </head>
 <body>
@@ -1030,6 +1205,11 @@ printAllBtn.onclick = () => submitPrint(allFiles(), printAllBtn);
 
 // --- Jobs panel ---
 const jobsList = document.getElementById("jobs-list");
+function esc(t) {{
+    return String(t).replace(/[&<>"']/g, c => ({{
+        "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;"
+    }})[c]);
+}}
 async function refreshJobs() {{
     const resp = await api("/jobs");
     if (!resp.ok) return;
@@ -1038,9 +1218,20 @@ async function refreshJobs() {{
         jobsList.innerHTML = '<div class="status-line">No jobs yet.</div>';
     }} else {{
         jobsList.innerHTML = data.jobs.map(j => {{
-            const cls = j.status === "done" ? "job-done" : (j.status === "error" ? "job-error" : "");
-            const names = j.files.map(f => f.name).join(", ");
-            return '<div class="job-row ' + cls + '">' + j.status.toUpperCase() + ' — ' + names + '</div>';
+            let cls = "";
+            if (j.status === "done") cls = "job-done";
+            else if (j.status === "error") cls = "job-error";
+            else if (j.status === "partial" || j.status === "unsupported") cls = "job-warn";
+            // Show why, not just that: a failed or skipped file is useless to
+            // the user without the reason, and it stays in the spool to retry.
+            const parts = j.files.map(f => {{
+                if (f.status === "done") return esc(f.name);
+                return esc(f.name) + ' <span class="job-detail">[' + esc(f.status) +
+                       (f.detail ? ": " + esc(f.detail) : "") + ']</span>';
+            }}).join(", ");
+            const jobErr = j.error ? ' <span class="job-detail">' + esc(j.error) + '</span>' : "";
+            return '<div class="job-row ' + cls + '">' + esc(j.status.toUpperCase()) +
+                   ' — ' + parts + jobErr + '</div>';
         }}).join("");
     }}
     // A last-updated timestamp that changes on every poll, so a no-op
