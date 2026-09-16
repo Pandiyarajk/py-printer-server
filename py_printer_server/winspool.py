@@ -15,6 +15,7 @@ ones, so non-ASCII printer and file names round-trip correctly.
 from __future__ import annotations
 
 import platform
+import winreg
 from ctypes import (
     POINTER,
     Structure,
@@ -32,6 +33,7 @@ from ctypes import (
     get_last_error,
     sizeof,
 )
+from pathlib import Path
 
 if platform.system() != "Windows":
     raise RuntimeError("py-printer-server requires Windows (uses ctypes bindings to winspool.drv)")
@@ -285,6 +287,38 @@ winspool.EnumJobsW.restype = c_int
 shell32.ShellExecuteW.argtypes = [c_void_p, c_wchar_p, c_wchar_p, c_wchar_p, c_wchar_p, c_int]
 shell32.ShellExecuteW.restype = c_void_p
 
+SEE_MASK_CLASSNAME = 0x00000001
+SEE_MASK_FLAG_NO_UI = 0x00000400
+
+
+class SHELLEXECUTEINFOW(Structure):
+    """Only used to force a specific alternate handler by ProgID (lpClass)
+    when the extension's current default handler has no ``printto`` verb --
+    see ``_find_alternate_printto_progid``. The plain ShellExecuteW path
+    above still handles the common case."""
+
+    _fields_ = [
+        ("cbSize", c_ulong),
+        ("fMask", c_ulong),
+        ("hwnd", c_void_p),
+        ("lpVerb", c_wchar_p),
+        ("lpFile", c_wchar_p),
+        ("lpParameters", c_wchar_p),
+        ("lpDirectory", c_wchar_p),
+        ("nShow", c_int),
+        ("hInstApp", c_void_p),
+        ("lpIDList", c_void_p),
+        ("lpClass", c_wchar_p),
+        ("hkeyClass", c_void_p),
+        ("dwHotKey", c_ulong),
+        ("hIconOrMonitor", c_void_p),
+        ("hProcess", c_void_p),
+    ]
+
+
+shell32.ShellExecuteExW.argtypes = [POINTER(SHELLEXECUTEINFOW)]
+shell32.ShellExecuteExW.restype = c_int
+
 
 class WinspoolError(RuntimeError):
     """Raised when a winspool.drv/shell32.dll call fails."""
@@ -432,16 +466,93 @@ def device_capabilities(device: str, port: str, capability: int) -> int:
     return result
 
 
+def _progid_has_printto(progid: str) -> bool:
+    try:
+        with winreg.OpenKey(winreg.HKEY_CLASSES_ROOT, f"{progid}\\shell\\printto\\command"):
+            return True
+    except OSError:
+        return False
+
+
+def _find_alternate_printto_progid(file_path: str) -> str | None:
+    """Find an installed handler for this file's extension that registers a
+    ``printto`` verb.
+
+    Needed because the extension's *current default* handler is not
+    guaranteed to support silent printing at all: Windows' built-in PDF
+    viewer (MSEdgePDF) registers only an ``open`` verb, so
+    ShellExecuteW("printto", ...) fails with SE_ERR_NOASSOC even when a
+    print-capable reader (e.g. Adobe Acrobat Reader) is installed and listed
+    as an alternate "Open with" choice for the same extension. Both the
+    per-user and machine-wide "Open with" lists are checked, since which one
+    holds a given ProgID depends on how it was installed.
+    """
+    ext = Path(file_path).suffix.lower()
+    if not ext:
+        return None
+
+    candidates: list[str] = []
+    for root, subkey in (
+        (winreg.HKEY_CURRENT_USER,
+         f"Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\FileExts\\{ext}\\OpenWithProgids"),
+        (winreg.HKEY_CLASSES_ROOT, f"{ext}\\OpenWithProgids"),
+    ):
+        try:
+            with winreg.OpenKey(root, subkey) as key:
+                i = 0
+                while True:
+                    try:
+                        name, _, _ = winreg.EnumValue(key, i)
+                    except OSError:
+                        break
+                    if name and name not in candidates:
+                        candidates.append(name)
+                    i += 1
+        except OSError:
+            pass
+
+    for progid in candidates:
+        if _progid_has_printto(progid):
+            return progid
+    return None
+
+
 def shell_print_to(printer_name: str, file_path: str) -> int:
-    """Invoke the shell's ``printto`` verb, returning the raw ShellExecuteW
-    result code.
+    """Invoke the shell's ``printto`` verb, returning a ShellExecuteW-style
+    result code (<= 32 is an error, see SE_ERR_NOASSOC and friends; anything
+    above 32 means a handoff to some application succeeded).
 
     ``printto`` (not ``print``) is required: the plain ``print`` verb always
     targets the system default printer and ignores the third argument, which
     would make the printer dropdown in the UI silently do nothing whenever it
-    was not already the default. A return value <= 32 is an error code (see
-    SE_ERR_NOASSOC and friends); anything above 32 is treated as a successful
-    handoff to whatever application is now printing the file.
+    was not already the default.
+
+    If the extension's current default handler has no ``printto`` verb at
+    all (see ``_find_alternate_printto_progid``), this retries against
+    whichever other installed handler for the same extension does have one,
+    by forcing that ProgID through ShellExecuteExW's lpClass -- rather than
+    failing outright just because the *default* choice happens to be a
+    viewer with no print automation.
     """
     result = shell32.ShellExecuteW(None, "printto", file_path, f'"{printer_name}"', None, SW_HIDE)
-    return int(result) if result else 0
+    code = int(result) if result else 0
+    if code > 32:
+        return code
+
+    progid = _find_alternate_printto_progid(file_path)
+    if progid is None:
+        return code
+
+    info = SHELLEXECUTEINFOW()
+    info.cbSize = sizeof(SHELLEXECUTEINFOW)
+    info.fMask = SEE_MASK_CLASSNAME | SEE_MASK_FLAG_NO_UI
+    info.lpVerb = "printto"
+    info.lpFile = file_path
+    info.lpParameters = f'"{printer_name}"'
+    info.lpClass = progid
+    info.nShow = SW_HIDE
+    ok = shell32.ShellExecuteExW(byref(info))
+    if not ok:
+        err = get_last_error()
+        return err if err else code
+    return 33

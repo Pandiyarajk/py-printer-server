@@ -364,15 +364,21 @@ class JobQueue:
             else:
                 queue_before = self._enum_jobs(job.options.printer)
                 print_via_shell(src, job.options)
-                self._wait_for_shell_job(job.options.printer, src.name, queue_before)
+                if not self._wait_for_shell_job(job.options.printer, src.name, queue_before):
+                    raise PrintError(
+                        f"{src.name} was handed to its shell handler, but no print job for it "
+                        f"ever reached the spooler within {JOB_APPEAR_TIMEOUT:.0f}s -- the handler "
+                        "may be stuck on a dialog (e.g. a first-run prompt) rather than printing"
+                    )
             jf.status = "done"
         except (PrintError, winspool.WinspoolError, OSError) as exc:
             jf.status = "error"
             jf.detail = str(exc)
             logger.warning("print failed for %s: %s", jf.name, exc)
 
-    def _wait_for_shell_job(self, printer: str, doc_name: str, queue_before: list[str]) -> None:
-        """Best-effort wait for a shell-launched job to drain from the queue.
+    def _wait_for_shell_job(self, printer: str, doc_name: str, queue_before: list[str]) -> bool:
+        """Best-effort wait for a shell-launched job to reach, then drain from,
+        the queue. Returns False if no new job was ever observed.
 
         Neither ShellExecuteW nor the handler it launches reports a usable job
         id, so this watches the queue as a whole rather than trying to identify
@@ -380,25 +386,38 @@ class JobQueue:
         prefixes it, Acrobat may use a full path), so name matching misses the
         job far more often than it finds it.
 
-        The rule is therefore: wait until the queue holds nothing beyond what
-        was already there before we launched, then return. Returning early when
-        the queue is already clear is correct and is the common case for a
-        fast, small document -- an earlier version required observing the job
-        present and then absent, so a job that came and went between two polls
-        was never seen and burned the entire timeout on every file.
+        ShellExecuteW only launches the handler; it returns long before that
+        process has actually spooled anything, so the very first poll -- taken
+        immediately after launch -- almost always sees no new job yet. Treating
+        "nothing new in the queue" as done at that point (an earlier version
+        did exactly this) reports success for a job that was never sent to the
+        printer at all, e.g. a cold-starting reader stuck behind a hidden
+        first-run dialog. So a new job must be *observed* at least once before
+        its later absence is read as "finished printing" -- only then does an
+        empty diff mean done rather than not-yet-started.
         """
         baseline = set(queue_before)
         deadline = time.time() + JOB_APPEAR_TIMEOUT
+        seen_new_job = False
         while time.time() < deadline:
             current = set(self._enum_jobs(printer))
-            if not (current - baseline):
-                return
+            if current - baseline:
+                seen_new_job = True
+            elif seen_new_job:
+                return True
             time.sleep(JOB_POLL_INTERVAL)
-        logger.info(
-            "queue for %s still busy %.0fs after launching %s; "
-            "not waiting further (the job may simply be large)",
-            printer, JOB_APPEAR_TIMEOUT, doc_name,
+        if seen_new_job:
+            logger.info(
+                "queue for %s still busy %.0fs after launching %s; "
+                "not waiting further (the job may simply be large)",
+                printer, JOB_APPEAR_TIMEOUT, doc_name,
+            )
+            return True
+        logger.warning(
+            "no print job for %s ever appeared on %s within %.0fs after launching its handler",
+            doc_name, printer, JOB_APPEAR_TIMEOUT,
         )
+        return False
 
     def _enum_jobs(self, printer: str) -> list[str]:
         handle = winspool.open_printer(printer)
