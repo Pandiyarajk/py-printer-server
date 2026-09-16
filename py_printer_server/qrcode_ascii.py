@@ -428,12 +428,23 @@ def generate_matrix(text: str) -> list[list[int]]:
     return best_matrix
 
 
-def render_ascii(matrix: list[list[int]], quiet_zone: int = 2) -> str:
-    """Render a module grid as half-block Unicode text for a terminal.
+_QUIET_ZONE = 4  # spec minimum (ISO/IEC 18004) -- scanners may refuse to lock on with less.
 
-    Each output line covers two module rows using U+2588/U+2580/U+2584/space,
-    so the printed QR code has roughly square modules instead of the tall
-    rectangles a naive one-row-per-line rendering would produce.
+
+def render_ascii(matrix: list[list[int]], quiet_zone: int = _QUIET_ZONE) -> str:
+    """Render a module grid as plain 7-bit ASCII text for a terminal.
+
+    Two `#` characters per module, one line per module row. This deliberately
+    avoids every Unicode block-drawing glyph (U+2580 "▀", U+2588 "█", etc.):
+    those exist in some legacy Windows OEM codepages (437) but not others
+    (1252), and even when the codepage matches, the classic "Raster Fonts"
+    bitmap font some cmd.exe windows still default to only has glyphs for its
+    own fixed set -- an unmapped Unicode code point renders as a broken glyph
+    there regardless of encoding, which silently corrupts the module grid a
+    scanner needs. Plain ASCII `#`/space has no such dependency: every
+    console font maps it correctly. The cost is a taller printout (roughly
+    double a half-block rendering), which is a small price for reliably
+    scanning.
     """
     size = len(matrix)
     padded_size = size + quiet_zone * 2
@@ -442,12 +453,9 @@ def render_ascii(matrix: list[list[int]], quiet_zone: int = 2) -> str:
         for c in range(size):
             padded[r + quiet_zone][c + quiet_zone] = matrix[r][c]
 
-    blocks = {(0, 0): " ", (0, 1): "▄", (1, 0): "▀", (1, 1): "█"}
     lines = []
-    for r in range(0, padded_size, 2):
-        top = padded[r]
-        bottom = padded[r + 1] if r + 1 < padded_size else [0] * padded_size
-        lines.append("".join(blocks[(top[c], bottom[c])] for c in range(padded_size)))
+    for row in padded:
+        lines.append("".join("##" if cell else "  " for cell in row))
     return "\n".join(lines)
 
 

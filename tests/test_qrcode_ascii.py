@@ -162,8 +162,13 @@ def test_too_large_payload_raises() -> None:
         qr.generate_matrix("x" * 1000)
 
 
-def test_render_ascii_has_quiet_zone_border() -> None:
-    text = qr.qr_ascii("http://192.168.1.1:8114")
+def test_render_ascii_has_spec_minimum_quiet_zone() -> None:
+    """ISO/IEC 18004 requires at least a 4-module quiet zone around the
+    symbol -- some scanners refuse to lock on with less."""
+    matrix = qr.generate_matrix("http://192.168.1.1:8114")
+    text = qr.render_ascii(matrix)
     lines = text.splitlines()
-    assert lines[0].strip(" ") == ""
-    assert all(c == " " for c in lines[0][:2])
+    assert len(lines) == len(matrix) + 2 * qr._QUIET_ZONE
+    for i in range(qr._QUIET_ZONE):
+        assert lines[i].strip(" ") == ""
+        assert lines[-1 - i].strip(" ") == ""
