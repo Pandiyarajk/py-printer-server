@@ -34,6 +34,11 @@ TEXT_LINES_PER_PAGE = 66
 # to spin up (Word/Acrobat cold start), so this is generous.
 JOB_APPEAR_TIMEOUT = 20.0
 JOB_POLL_INTERVAL = 0.5
+# Polled faster than JOB_POLL_INTERVAL while waiting for a shell-launched job
+# to *appear*: that job is only ever identified by catching it in the queue, so
+# a short job slipping between two polls would be reported as never printed.
+# Once it has been seen, the drain wait backs off to JOB_POLL_INTERVAL.
+JOB_APPEAR_POLL_INTERVAL = 0.1
 
 
 class PrintError(RuntimeError):
@@ -370,13 +375,20 @@ class JobQueue:
             if decision.route == PrintRoute.RAW_TEXT:
                 job_id = print_text(src, session)
                 if not self._wait_for_job_id(job.options.printer, job_id):
-                    raise PrintError(
-                        f"{src.name} is still on {job.options.printer}'s print queue "
-                        f"{JOB_APPEAR_TIMEOUT:.0f}s after being spooled -- not waiting further "
-                        "(the job may simply be large, or the printer may be jammed/offline)"
+                    # Still queued at the deadline is not a failure: the job
+                    # demonstrably reached the spooler (StartDocPrinterW gave
+                    # us this id and every page was written), so it is a large
+                    # job still printing, not a lost one. Calling that an error
+                    # would leave the file in the spool inviting a retry, and
+                    # the retry prints it a second time. The shell path below
+                    # treats the same state as success for the same reason.
+                    logger.info(
+                        "%s is still on %s's queue %.0fs after spooling; "
+                        "not waiting further (the job may simply be large)",
+                        src.name, job.options.printer, JOB_APPEAR_TIMEOUT,
                     )
             else:
-                queue_before = self._enum_jobs(job.options.printer)
+                queue_before = self._enum_job_ids(job.options.printer)
                 print_via_shell(src, job.options)
                 if not self._wait_for_shell_job(job.options.printer, src.name, queue_before):
                     raise PrintError(
@@ -390,15 +402,17 @@ class JobQueue:
             jf.detail = str(exc)
             logger.warning("print failed for %s: %s", jf.name, exc)
 
-    def _wait_for_shell_job(self, printer: str, doc_name: str, queue_before: list[str]) -> bool:
+    def _wait_for_shell_job(self, printer: str, doc_name: str, ids_before: set[int]) -> bool:
         """Best-effort wait for a shell-launched job to reach, then drain from,
         the queue. Returns False if no new job was ever observed.
 
-        Neither ShellExecuteW nor the handler it launches reports a usable job
-        id, so this watches the queue as a whole rather than trying to identify
-        "our" job by name: handlers routinely rename the spool document (Word
-        prefixes it, Acrobat may use a full path), so name matching misses the
-        job far more often than it finds it.
+        Neither ShellExecuteW nor the handler it launches reports the job id
+        back, so the job has to be spotted by diffing the queue. That diff is
+        taken over spooler job *ids*, not document names: handlers rename the
+        spool document freely (Word prefixes it, Acrobat may use a full path),
+        and -- worse -- a name that already appears in the baseline hides the
+        new job completely, which happens routinely when the same file is
+        printed twice. Job ids are unique per spooler, so neither confuses it.
 
         ShellExecuteW only launches the handler; it returns long before that
         process has actually spooled anything, so the very first poll -- taken
@@ -409,18 +423,26 @@ class JobQueue:
         first-run dialog. So a new job must be *observed* at least once before
         its later absence is read as "finished printing" -- only then does an
         empty diff mean done rather than not-yet-started.
+
+        The flip side of requiring that observation is a job finishing between
+        two polls, which would never be seen and so be reported as a failure
+        even though it printed. Hence the tight poll while waiting for it to
+        appear (JOB_APPEAR_POLL_INTERVAL): once it has been seen there is
+        nothing left to race with, so the wait for it to drain backs off to
+        the slower JOB_POLL_INTERVAL.
         """
-        baseline = set(queue_before)
+        baseline = set(ids_before)
         deadline = time.time() + JOB_APPEAR_TIMEOUT
-        seen_new_job = False
+        ours: set[int] = set()
         while time.time() < deadline:
-            current = set(self._enum_jobs(printer))
-            if current - baseline:
-                seen_new_job = True
-            elif seen_new_job:
+            current = self._enum_job_ids(printer)
+            ours |= current - baseline
+            # Wait for *our* ids to leave, not for the queue to go quiet: a
+            # job another application queues meanwhile is not ours to wait on.
+            if ours and not (ours & current):
                 return True
-            time.sleep(JOB_POLL_INTERVAL)
-        if seen_new_job:
+            time.sleep(JOB_POLL_INTERVAL if ours else JOB_APPEAR_POLL_INTERVAL)
+        if ours:
             logger.info(
                 "queue for %s still busy %.0fs after launching %s; "
                 "not waiting further (the job may simply be large)",
@@ -449,17 +471,19 @@ class JobQueue:
             time.sleep(JOB_POLL_INTERVAL)
         return job_id not in self._enum_job_ids(printer)
 
-    def _enum_job_infos(self, printer: str) -> list[tuple[int, str | None]]:
-        """Return (JobId, pDocument) for every job currently on `printer`.
+    def _enum_job_ids(self, printer: str) -> set[int]:
+        """Return the spooler job id of every job currently on `printer`.
 
-        Values are read out of the ctypes structs and returned as plain
-        Python objects *before* this function returns -- pDocument is a
-        c_wchar_p, materialised to a str the moment it is read, so the tuples
-        stay valid after `buf` (and the handle) are gone. Handing back the
-        JOB_INFO_1W structs themselves, or the array, would be wrong the same
-        way passing back `buf` would: their string pointers reference this
-        function's buffer, which is freed on return -- the exact bug that
-        once produced garbage printer names from EnumPrintersW.
+        Ids, not document names: a name is neither unique (printing the same
+        file twice puts two identically named jobs on the queue) nor stable
+        (a shell handler renames the spool document as it likes), and both
+        wait loops above identify a job purely by diffing this set.
+
+        JobId is a c_ulong, so each value is copied into a plain int on
+        access and nothing here outlives `buf`. Returning the JOB_INFO_1W
+        structs instead would not be safe: their string pointers reference
+        this function's buffer, freed on return -- the exact bug that once
+        produced garbage printer names from EnumPrintersW.
         """
         handle = winspool.open_printer(printer)
         try:
@@ -467,24 +491,18 @@ class JobQueue:
             returned = c_ulong(0)
             ok = winspool.winspool.EnumJobsW(handle, 0, 0xFFFFFFFF, 1, None, 0, byref(needed), byref(returned))
             if not ok and get_last_error() != winspool.ERROR_INSUFFICIENT_BUFFER:
-                return []
+                return set()
             if needed.value == 0:
-                return []
+                return set()
             buf = create_string_buffer(needed.value)
             ok = winspool.winspool.EnumJobsW(handle, 0, 0xFFFFFFFF, 1, buf, needed.value, byref(needed), byref(returned))
             if not ok:
-                return []
+                return set()
             array_type = winspool.JOB_INFO_1W * returned.value
             array = cast(buf, ctypes.POINTER(array_type)).contents
-            return [(j.JobId, j.pDocument) for j in array]
+            return {j.JobId for j in array}
         finally:
             winspool.close_printer(handle)
-
-    def _enum_jobs(self, printer: str) -> list[str]:
-        return [doc for _job_id, doc in self._enum_job_infos(printer) if doc]
-
-    def _enum_job_ids(self, printer: str) -> set[int]:
-        return {job_id for job_id, _doc in self._enum_job_infos(printer)}
 
     def _archive(self, job: Job, spool_dir: Path) -> None:
         """Move successfully printed files into a per-job archive folder.

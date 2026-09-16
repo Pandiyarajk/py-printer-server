@@ -132,3 +132,59 @@ class TestWaitForJobId:
         monkeypatch.setattr(printing, "JOB_POLL_INTERVAL", 0.01)
         q = self._queue(tmp_path, [{42}])
         assert q._wait_for_job_id("Test Printer", 42, timeout=0.03) is False
+
+
+class TestWaitForShellJob:
+    """The shell handler never reports its job id back, so the job is found by
+    diffing the queue -- which has to be done on ids, and has to tolerate a
+    job that finishes quickly, or a file that did print gets reported as an
+    error and left in the spool, where retrying it prints it twice.
+    """
+
+    def _queue(self, tmp_path: Path, sequence: list[set[int]]) -> JobQueue:
+        jobs = tmp_path / "jobs"
+        jobs.mkdir()
+        q = JobQueue(jobs, dry_run=True)
+        calls = iter(sequence)
+        q._enum_job_ids = lambda printer: next(calls, sequence[-1])  # type: ignore[method-assign]
+        return q
+
+    def test_waits_for_job_to_appear_then_drain(self, tmp_path: Path, monkeypatch) -> None:
+        from py_printer_server import printing
+        monkeypatch.setattr(printing, "JOB_POLL_INTERVAL", 0.01)
+        monkeypatch.setattr(printing, "JOB_APPEAR_POLL_INTERVAL", 0.01)
+        monkeypatch.setattr(printing, "JOB_APPEAR_TIMEOUT", 1.0)
+        q = self._queue(tmp_path, [set(), {7}, {7}, set()])
+        assert q._wait_for_shell_job("Test Printer", "a.pdf", set()) is True
+
+    def test_reports_failure_when_no_job_ever_appears(self, tmp_path: Path, monkeypatch) -> None:
+        """A handler stuck on a first-run dialog spools nothing; that must not
+        be reported as printed."""
+        from py_printer_server import printing
+        monkeypatch.setattr(printing, "JOB_POLL_INTERVAL", 0.01)
+        monkeypatch.setattr(printing, "JOB_APPEAR_POLL_INTERVAL", 0.01)
+        monkeypatch.setattr(printing, "JOB_APPEAR_TIMEOUT", 0.05)
+        q = self._queue(tmp_path, [set()])
+        assert q._wait_for_shell_job("Test Printer", "a.pdf", set()) is False
+
+    def test_duplicate_document_name_does_not_hide_the_new_job(self, tmp_path: Path, monkeypatch) -> None:
+        """Printing the same file twice puts two identically named jobs on the
+        queue. Diffing on ids still spots the second one; diffing on names --
+        which this used to do -- saw no change and timed out as a failure."""
+        from py_printer_server import printing
+        monkeypatch.setattr(printing, "JOB_POLL_INTERVAL", 0.01)
+        monkeypatch.setattr(printing, "JOB_APPEAR_POLL_INTERVAL", 0.01)
+        monkeypatch.setattr(printing, "JOB_APPEAR_TIMEOUT", 1.0)
+        # Job 1 is already queued under the same document name; ours is id 2.
+        q = self._queue(tmp_path, [{1}, {1, 2}, {1}])
+        assert q._wait_for_shell_job("Test Printer", "a.pdf", {1}) is True
+
+    def test_does_not_wait_on_another_applications_job(self, tmp_path: Path, monkeypatch) -> None:
+        """Ours drained; an unrelated job queued meanwhile is not ours to wait
+        for."""
+        from py_printer_server import printing
+        monkeypatch.setattr(printing, "JOB_POLL_INTERVAL", 0.01)
+        monkeypatch.setattr(printing, "JOB_APPEAR_POLL_INTERVAL", 0.01)
+        monkeypatch.setattr(printing, "JOB_APPEAR_TIMEOUT", 1.0)
+        q = self._queue(tmp_path, [{5}, {9}])
+        assert q._wait_for_shell_job("Test Printer", "a.pdf", set()) is True

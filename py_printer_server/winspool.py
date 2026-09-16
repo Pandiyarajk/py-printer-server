@@ -14,9 +14,21 @@ ones, so non-ASCII printer and file names round-trip correctly.
 
 from __future__ import annotations
 
+import logging
 import platform
-import winreg
-from ctypes import (
+
+if platform.system() != "Windows":
+    raise RuntimeError("py-printer-server requires Windows (uses ctypes bindings to winspool.drv)")
+
+# Everything below is Windows-only and must stay below that guard: winreg does
+# not exist on other platforms, and ctypes defines WinError, get_last_error and
+# WinDLL only there. Importing any of them above it turns the deliberate
+# RuntimeError -- which server.py relies on to keep the rest of the package
+# importable off Windows -- into a bare ImportError from an unrelated-looking
+# line.
+import ctypes  # noqa: E402
+import winreg  # noqa: E402
+from ctypes import (  # noqa: E402
     POINTER,
     Structure,
     WinError,
@@ -33,12 +45,9 @@ from ctypes import (
     get_last_error,
     sizeof,
 )
-from pathlib import Path
+from pathlib import Path  # noqa: E402
 
-if platform.system() != "Windows":
-    raise RuntimeError("py-printer-server requires Windows (uses ctypes bindings to winspool.drv)")
-
-import ctypes  # noqa: E402  (after the platform guard, deliberately)
+logger = logging.getLogger("printer_server")
 
 winspool = ctypes.WinDLL("winspool.drv", use_last_error=True)
 shell32 = ctypes.WinDLL("shell32.dll", use_last_error=True)
@@ -553,6 +562,14 @@ def shell_print_to(printer_name: str, file_path: str) -> int:
     info.nShow = SW_HIDE
     ok = shell32.ShellExecuteExW(byref(info))
     if not ok:
-        err = get_last_error()
-        return err if err else code
+        # Return the original ShellExecuteW code, NOT GetLastError(). Callers
+        # read this value as a ShellExecuteW result, where anything above 32
+        # means success -- and Win32 error codes routinely exceed 32 (1155
+        # ERROR_NO_ASSOCIATION, 1223 ERROR_CANCELLED), so handing one back
+        # here reports a file that never printed as printed.
+        logger.warning(
+            "printto via alternate handler %s failed for %s: %s",
+            progid, file_path, WinError(get_last_error()),
+        )
+        return code
     return 33
