@@ -172,3 +172,61 @@ def test_render_ascii_has_spec_minimum_quiet_zone() -> None:
     for i in range(qr._QUIET_ZONE):
         assert lines[i].strip(" ") == ""
         assert lines[-1 - i].strip(" ") == ""
+
+
+def test_render_compact_is_half_the_lines_and_square() -> None:
+    """Two module rows per line is what makes each module square: a terminal
+    cell is about twice as tall as it is wide."""
+    matrix = qr.generate_matrix("http://192.168.1.1:8114")
+    lines = qr.render_compact(matrix).splitlines()
+    width = len(matrix) + 2 * qr._QUIET_ZONE
+    assert len(lines) == (width + 1) // 2
+    assert all(len(line) == width for line in lines)
+    # Blank is U+00A0, not U+0020: cp437 byte 255, as the qrcode package uses.
+    assert set("".join(lines)) <= {"\u00a0", "▀", "▄", "█"}
+
+
+@pytest.mark.parametrize("url", [
+    "http://192.168.1.1:8114",
+    "http://a.b.c.d:1/" + "x" * 200,  # version >= 7, so version info is present too
+])
+def test_both_format_info_copies_agree(url: str) -> None:
+    """The format info is written twice, and the two copies must be
+    identical in all 15 bits. Dropping one bit of the second copy still
+    scans -- format info is BCH-protected -- so only an explicit comparison
+    catches it; the round-trip decoder above reads copy A alone.
+    """
+    matrix = qr.generate_matrix(url)
+    size = len(matrix)
+    copy_a = [
+        matrix[8][0], matrix[8][1], matrix[8][2], matrix[8][3], matrix[8][4], matrix[8][5],
+        matrix[8][7], matrix[8][8], matrix[7][8],
+        matrix[5][8], matrix[4][8], matrix[3][8], matrix[2][8], matrix[1][8], matrix[0][8],
+    ]
+    copy_b = [matrix[size - 1 - i][8] for i in range(7)]
+    copy_b += [matrix[8][size - 8 + i] for i in range(8)]
+    assert copy_a == copy_b
+    assert matrix[size - 8][8] == 1, "the module below copy B must always be dark"
+
+
+def test_version_info_decodes_back_to_the_symbol_version() -> None:
+    """Version info is placed bit 0 first (LSB), and a reader validates it
+    with a BCH check. Reversing the order still scans, because a reader that
+    fails that check falls back to deriving the version from the symbol
+    size -- which is exactly what the round-trip decoder above does, so it
+    cannot catch this.
+    """
+    matrix = qr.generate_matrix("http://a.b.c.d:1/" + "x" * 200)
+    size = len(matrix)
+    version = (size - 17) // 4
+    assert version >= 7, "test needs a version that carries version info"
+
+    value = 0
+    for i in range(18):
+        value |= matrix[i // 3][size - 11 + i % 3] << i
+    assert qr._bch_remainder(value, qr._VERSION_GENERATOR) == 0
+    assert value >> 12 == version
+
+    # The same 18 bits appear again, transposed, near the bottom-left finder.
+    for i in range(18):
+        assert matrix[size - 11 + i % 3][i // 3] == (value >> i) & 1

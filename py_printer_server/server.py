@@ -1514,17 +1514,23 @@ document.getElementById("delete-all-btn").onclick = () => deleteFolders(allFolde
 def _print_qr(url: str) -> None:
     """Print a scannable QR code for `url`.
 
-    Uses render_ascii()'s plain 7-bit rendering -- see its docstring for why
-    this is the one configuration confirmed to both scan correctly and print
-    as a square grid, and why a smaller or Unicode-packed rendering was
-    tried and rolled back rather than kept as the default.
+    Prefers the compact half-block rendering (square modules, half the
+    lines); falls back to the plain-ASCII one if this console cannot encode
+    those glyphs, which prints larger and taller but needs nothing beyond
+    7-bit ASCII.
     """
-    from py_printer_server.qrcode_ascii import qr_ascii
+    from py_printer_server.qrcode_ascii import generate_matrix, render_ascii, render_compact
 
     try:
-        print(qr_ascii(url))
+        matrix = generate_matrix(url)
     except ValueError as exc:
         logger.warning("could not build QR code: %s", exc)
+        return
+
+    try:
+        print(render_compact(matrix))
+    except UnicodeEncodeError:
+        print(render_ascii(matrix))
 
 
 def main() -> int:

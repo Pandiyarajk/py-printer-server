@@ -103,9 +103,19 @@ def _format_bits(mask: int) -> list[int]:
 
 
 def _version_bits(version: int) -> list[int]:
+    """Version info as 18 bits, index 0 = least significant.
+
+    LSB-first, unlike _format_bits: the spec numbers the version-info bits
+    from the LSB and places bit i at a position derived from i directly
+    (see _build_matrix), so returning them MSB-first silently mirrors the
+    whole block -- a decoder then reads a nonsense version number with a
+    failing BCH check. Symbols still scanned, because a reader that cannot
+    validate the version info falls back to deriving the version from the
+    symbol's size, which masks the bug entirely.
+    """
     shifted = version << 12
     bits = shifted | _bch_remainder(shifted, _VERSION_GENERATOR)
-    return [(bits >> (17 - i)) & 1 for i in range(18)]
+    return [(bits >> i) & 1 for i in range(18)]
 
 
 # ---------------------------------------------------------------------------
@@ -336,10 +346,18 @@ def _build_matrix(version: int, mask: int, data_bits: list[int]) -> list[list[in
                         (7, 8), (5, 8), (4, 8), (3, 8), (2, 8), (1, 8), (0, 8)]
     for (r, c), bit in zip(fmt_positions_a, fmt):
         matrix[r][c] = bit
+    # Second copy: 7 bits down column 8 from the bottom edge, then the
+    # remaining 8 along row 8 to the right edge. That second run starts at
+    # size-8, not size-7: it carries fmt[7] too, and dropping it (leaving
+    # that module light) makes the two copies disagree in one bit. Format
+    # info is BCH-protected well enough that a reader still recovers it, so
+    # the symbol scans and the mismatch stays invisible. The always-dark
+    # module sits at (size-8, 8) -- column 8, not row 8 -- so it does not
+    # collide with this run.
     for i, bit in enumerate(fmt[:7]):
         matrix[size - 1 - i][8] = bit
-    for i, bit in enumerate(fmt[8:]):
-        matrix[8][size - 7 + i] = bit
+    for i, bit in enumerate(fmt[7:]):
+        matrix[8][size - 8 + i] = bit
     matrix[size - 8][8] = 1
 
     if version >= 7:
@@ -431,41 +449,64 @@ def generate_matrix(text: str) -> list[list[int]]:
 _QUIET_ZONE = 4  # spec minimum (ISO/IEC 18004) -- scanners may refuse to lock on with less.
 
 
-def render_ascii(matrix: list[list[int]], quiet_zone: int = _QUIET_ZONE) -> str:
-    """Render a module grid as plain 7-bit ASCII text for a terminal.
-
-    One `#` character per module, one line per module row. This deliberately
-    avoids every Unicode block-drawing glyph (U+2580 "▀", U+2588 "█", etc.):
-    those exist in some legacy Windows OEM codepages (437) but not others
-    (1252), and even where the codepage matches, some terminals render the
-    "Ambiguous width" block-drawing range double-wide, and the classic
-    "Raster Fonts" bitmap font some cmd.exe windows still default to only
-    covers its own fixed glyph set -- any of these silently distorts or
-    breaks the module grid a scanner needs, with no exception raised to
-    catch it. Plain ASCII `#`/space has none of these failure modes: every
-    console font and codepage renders it identically.
-
-    One character wide -- rather than the two that would keep each module
-    square in a typical ~1:2 (width:height) monospace cell -- trades shape
-    for size: modules print narrower than tall, but this halves the total
-    footprint and was not the configuration reported as failing to scan
-    (only the later, further, Unicode-packed attempt was). The quiet zone
-    (spec minimum 4 modules -- see _QUIET_ZONE) is untouched: that one is
-    load-bearing, not cosmetic, unlike this one.
-    """
+def _padded_grid(matrix: list[list[int]], quiet_zone: int) -> list[list[int]]:
     size = len(matrix)
     padded_size = size + quiet_zone * 2
     padded = [[0] * padded_size for _ in range(padded_size)]
     for r in range(size):
         for c in range(size):
             padded[r + quiet_zone][c + quiet_zone] = matrix[r][c]
+    return padded
 
+
+# Half-block glyphs indexed by (top module, bottom module), matching the
+# `qrcode` package's print_ascii(): it builds the same four characters as
+# cp437 bytes 255/223/220/219 decoded, which are exactly U+00A0, U+2580,
+# U+2584, U+2588. The blank is a no-break space rather than a plain one,
+# also as qrcode does.
+_HALF_BLOCK = {(0, 0): "\u00a0", (1, 0): "▀", (0, 1): "▄", (1, 1): "█"}
+
+
+def render_compact(matrix: list[list[int]], quiet_zone: int = _QUIET_ZONE) -> str:
+    """Render a module grid the way the `qrcode` package's print_ascii does.
+
+    One character per module column, two module rows per line, using the
+    half-block glyphs U+2580/U+2584/U+2588. A terminal cell is about twice
+    as tall as it is wide, so stacking two modules into one cell is what
+    makes each module come out square -- rendering one module per line
+    instead (which is what plain ASCII has to do, having no half-height
+    glyph) prints the same symbol as a portrait rectangle twice as tall as
+    it is wide.
+
+    Needs a console that can encode and draw these code points; callers
+    should fall back to render_ascii() if writing this raises
+    UnicodeEncodeError.
+    """
+    padded = _padded_grid(matrix, quiet_zone)
+    width = len(padded)
     lines = []
-    for row in padded:
-        lines.append("".join("#" if cell else " " for cell in row))
+    for r in range(0, width, 2):
+        top = padded[r]
+        bottom = padded[r + 1] if r + 1 < width else [0] * width
+        lines.append("".join(_HALF_BLOCK[(top[c], bottom[c])] for c in range(width)))
     return "\n".join(lines)
 
 
+def render_ascii(matrix: list[list[int]], quiet_zone: int = _QUIET_ZONE) -> str:
+    """Render a module grid as plain 7-bit ASCII -- the fallback renderer.
+
+    One `#` character per module, one line per module row. Prints as a
+    portrait rectangle (a terminal cell is roughly twice as tall as it is
+    wide, and ASCII has no half-height glyph to stack two modules into one
+    cell), and twice the lines of render_compact(), so this is only the
+    fallback for a console that cannot encode render_compact()'s
+    half-blocks. Nothing here depends on a codepage or font covering
+    anything beyond 7-bit ASCII, which is the point.
+    """
+    padded = _padded_grid(matrix, quiet_zone)
+    return "\n".join("".join("#" if cell else " " for cell in row) for row in padded)
+
+
 def qr_ascii(text: str) -> str:
-    """Convenience: encode `text` and render it in one call."""
-    return render_ascii(generate_matrix(text))
+    """Convenience: encode `text` and render it compactly in one call."""
+    return render_compact(generate_matrix(text))
