@@ -434,7 +434,7 @@ _QUIET_ZONE = 4  # spec minimum (ISO/IEC 18004) -- scanners may refuse to lock o
 def render_ascii(matrix: list[list[int]], quiet_zone: int = _QUIET_ZONE) -> str:
     """Render a module grid as plain 7-bit ASCII text for a terminal.
 
-    Two `#` characters per module, one line per module row. This deliberately
+    One `#` character per module, one line per module row. This deliberately
     avoids every Unicode block-drawing glyph (U+2580 "▀", U+2588 "█", etc.):
     those exist in some legacy Windows OEM codepages (437) but not others
     (1252), and even where the codepage matches, some terminals render the
@@ -445,14 +445,13 @@ def render_ascii(matrix: list[list[int]], quiet_zone: int = _QUIET_ZONE) -> str:
     catch it. Plain ASCII `#`/space has none of these failure modes: every
     console font and codepage renders it identically.
 
-    Two characters wide keeps each module square in the overwhelmingly
-    common ~1:2 (width:height) monospace font cell -- this exact
-    configuration (plus the spec-minimum quiet zone below) is the one
-    confirmed scanning correctly. A narrower or Unicode-packed rendering
-    would print smaller, but at the cost of either shape (non-square
-    modules) or one of the reliability guarantees above; neither trade was
-    confirmed safe on the console this was tested from, so this stays the
-    default.
+    One character wide -- rather than the two that would keep each module
+    square in a typical ~1:2 (width:height) monospace cell -- trades shape
+    for size: modules print narrower than tall, but this halves the total
+    footprint and was not the configuration reported as failing to scan
+    (only the later, further, Unicode-packed attempt was). The quiet zone
+    (spec minimum 4 modules -- see _QUIET_ZONE) is untouched: that one is
+    load-bearing, not cosmetic, unlike this one.
     """
     size = len(matrix)
     padded_size = size + quiet_zone * 2
@@ -463,7 +462,7 @@ def render_ascii(matrix: list[list[int]], quiet_zone: int = _QUIET_ZONE) -> str:
 
     lines = []
     for row in padded:
-        lines.append("".join("##" if cell else "  " for cell in row))
+        lines.append("".join("#" if cell else " " for cell in row))
     return "\n".join(lines)
 
 
