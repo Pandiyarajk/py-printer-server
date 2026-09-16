@@ -19,6 +19,7 @@ import logging
 import logging.handlers
 import os
 import secrets
+import shutil
 import socket
 import socketserver
 import sys
@@ -122,6 +123,10 @@ def _parse_args():
     parser.add_argument(
         "--generate-password", action="store_true",
         help="Print a strong random ADMIN_PASSWORD suggestion and exit",
+    )
+    parser.add_argument(
+        "--no-qr", action="store_true",
+        help="Do not print a QR code for the LAN URL on startup",
     )
     return parser.parse_args()
 
@@ -274,6 +279,8 @@ class Handler(http.server.SimpleHTTPRequestHandler):
         POST /delete        — remove a spool file without printing it
         GET  /settings      — current default print options (admin only)
         POST /settings      — save default print options (admin only)
+        GET  /archive       — archived (printed) job folders, with delete UI
+        POST /archive/delete — permanently delete one or more archived job folders
     """
 
     def parse_path(self, raw_path: str) -> tuple[str, dict]:
@@ -1030,7 +1037,7 @@ th {{ color: var(--text-muted); font-weight: 600; font-size: 12px; text-transfor
     <div class="print-bar">
         <select id="printer-select"></select>
         <label><input type="checkbox" id="show-virtual"> Show all printers</label>
-        <label><input type="checkbox" id="color-toggle" checked> Colour</label>
+        <label><input type="checkbox" id="color-toggle"> Colour</label>
         <select id="paper-select"><option value="A4" selected>A4</option><option value="Letter">Letter</option></select>
         <label>Copies <input type="number" id="copies-input" value="1" min="1" max="99" style="width:60px"></label>
         <label><input type="checkbox" id="duplex-toggle"> Duplex</label>
@@ -1305,8 +1312,15 @@ def main() -> int:
         return 1
 
     with httpd:
+        url = lan_url(PORT)
         print(f"Print Server: http://localhost:{PORT}")
-        print(f"From another device on this network: {lan_url(PORT)}")
+        print(f"From another device on this network: {url}")
+        if not args.no_qr:
+            try:
+                from py_printer_server.qrcode_ascii import qr_ascii
+                print(qr_ascii(url))
+            except (UnicodeEncodeError, ValueError) as exc:
+                logger.warning("could not render QR code: %s", exc)
         if args.dry_run:
             print("DRY RUN: jobs will be logged, not sent to a printer.")
         try:
