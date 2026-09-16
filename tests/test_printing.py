@@ -98,3 +98,37 @@ def test_archive_skips_missing_source_file(tmp_path: Path) -> None:
     archives = list(jobs.iterdir())
     assert len(archives) == 1
     assert (archives[0] / "job.json").exists()
+
+
+class TestWaitForJobId:
+    """A job reported done must mean paper actually came out (see
+    JobQueue._overall_status): print_text() only confirms the data reached
+    the spooler, so _process_one must wait for the job to drain from the
+    queue before marking a text file "done". Unlike the shell-verb wait,
+    there is no "did it ever appear?" ambiguity for a job id StartDocPrinterW
+    itself returned -- its absence at any point means finished.
+    """
+
+    def _queue(self, tmp_path: Path, sequence: list[set[int]]) -> JobQueue:
+        jobs = tmp_path / "jobs"
+        jobs.mkdir()
+        q = JobQueue(jobs, dry_run=True)
+        calls = iter(sequence)
+        q._enum_job_ids = lambda printer: next(calls, sequence[-1])  # type: ignore[method-assign]
+        return q
+
+    def test_returns_true_immediately_if_already_gone(self, tmp_path: Path) -> None:
+        q = self._queue(tmp_path, [set()])
+        assert q._wait_for_job_id("Test Printer", 42, timeout=0.05) is True
+
+    def test_returns_true_once_job_drains(self, tmp_path: Path, monkeypatch) -> None:
+        from py_printer_server import printing
+        monkeypatch.setattr(printing, "JOB_POLL_INTERVAL", 0.01)
+        q = self._queue(tmp_path, [{42}, {42}, set()])
+        assert q._wait_for_job_id("Test Printer", 42, timeout=1.0) is True
+
+    def test_returns_false_if_still_present_at_deadline(self, tmp_path: Path, monkeypatch) -> None:
+        from py_printer_server import printing
+        monkeypatch.setattr(printing, "JOB_POLL_INTERVAL", 0.01)
+        q = self._queue(tmp_path, [{42}])
+        assert q._wait_for_job_id("Test Printer", 42, timeout=0.03) is False

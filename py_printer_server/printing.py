@@ -159,8 +159,15 @@ def paginate_text(text: str) -> list[str]:
     return pages or ["\f"]
 
 
-def print_text(src: Path, session: "PrinterSession") -> None:
+def print_text(src: Path, session: "PrinterSession") -> int:
     """Print a plain text file by writing it through the spooler.
+
+    Returns the spooler job id so the caller can wait for it to actually
+    drain from the printer's queue -- StartDocPrinterW/WritePrinter/
+    EndDocPrinter only confirm the data reached the spooler, not that paper
+    came out. An earlier version marked the file "done" as soon as this
+    function returned, which could report success while the job was still
+    sitting in (or being printed from) the Windows print queue.
 
     Copies are NOT looped here: the session's devmode already carries
     dmCopies, and doing both multiplies them.
@@ -205,6 +212,7 @@ def print_text(src: Path, session: "PrinterSession") -> None:
                 winspool.winspool.EndPagePrinter(handle)
     finally:
         winspool.winspool.EndDocPrinter(handle)
+    return job_id
 
 
 def print_via_shell(src: Path, options: PrintOptions) -> None:
@@ -360,7 +368,13 @@ class JobQueue:
             return
         try:
             if decision.route == PrintRoute.RAW_TEXT:
-                print_text(src, session)
+                job_id = print_text(src, session)
+                if not self._wait_for_job_id(job.options.printer, job_id):
+                    raise PrintError(
+                        f"{src.name} is still on {job.options.printer}'s print queue "
+                        f"{JOB_APPEAR_TIMEOUT:.0f}s after being spooled -- not waiting further "
+                        "(the job may simply be large, or the printer may be jammed/offline)"
+                    )
             else:
                 queue_before = self._enum_jobs(job.options.printer)
                 print_via_shell(src, job.options)
@@ -419,7 +433,34 @@ class JobQueue:
         )
         return False
 
-    def _enum_jobs(self, printer: str) -> list[str]:
+    def _wait_for_job_id(self, printer: str, job_id: int, timeout: float = JOB_APPEAR_TIMEOUT) -> bool:
+        """Wait for a specific spooler job id to drain from the queue.
+
+        Unlike _wait_for_shell_job, there is no "did it ever appear?"
+        ambiguity here: StartDocPrinterW already returned this exact job id,
+        so its absence at any point means it finished (printed, or was
+        cancelled/errored out on the printer's side) -- not that it never
+        started.
+        """
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            if job_id not in self._enum_job_ids(printer):
+                return True
+            time.sleep(JOB_POLL_INTERVAL)
+        return job_id not in self._enum_job_ids(printer)
+
+    def _enum_job_infos(self, printer: str) -> list[tuple[int, str | None]]:
+        """Return (JobId, pDocument) for every job currently on `printer`.
+
+        Values are read out of the ctypes structs and returned as plain
+        Python objects *before* this function returns -- pDocument is a
+        c_wchar_p, materialised to a str the moment it is read, so the tuples
+        stay valid after `buf` (and the handle) are gone. Handing back the
+        JOB_INFO_1W structs themselves, or the array, would be wrong the same
+        way passing back `buf` would: their string pointers reference this
+        function's buffer, which is freed on return -- the exact bug that
+        once produced garbage printer names from EnumPrintersW.
+        """
         handle = winspool.open_printer(printer)
         try:
             needed = c_ulong(0)
@@ -435,14 +476,15 @@ class JobQueue:
                 return []
             array_type = winspool.JOB_INFO_1W * returned.value
             array = cast(buf, ctypes.POINTER(array_type)).contents
-            # Reading .pDocument (a c_wchar_p field) makes ctypes copy the
-            # string into a Python str immediately, so these survive `buf`
-            # going out of scope. Do not change this to hand back the structs
-            # themselves -- their pointers would dangle, which is exactly the
-            # bug that produced garbage printer names from EnumPrintersW.
-            return [j.pDocument for j in array if j.pDocument]
+            return [(j.JobId, j.pDocument) for j in array]
         finally:
             winspool.close_printer(handle)
+
+    def _enum_jobs(self, printer: str) -> list[str]:
+        return [doc for _job_id, doc in self._enum_job_infos(printer) if doc]
+
+    def _enum_job_ids(self, printer: str) -> set[int]:
+        return {job_id for job_id, _doc in self._enum_job_infos(printer)}
 
     def _archive(self, job: Job, spool_dir: Path) -> None:
         """Move successfully printed files into a per-job archive folder.
