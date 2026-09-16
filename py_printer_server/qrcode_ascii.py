@@ -434,7 +434,7 @@ _QUIET_ZONE = 4  # spec minimum (ISO/IEC 18004) -- scanners may refuse to lock o
 def render_ascii(matrix: list[list[int]], quiet_zone: int = _QUIET_ZONE) -> str:
     """Render a module grid as plain 7-bit ASCII text for a terminal.
 
-    Two `#` characters per module, one line per module row. This deliberately
+    One `#` character per module, one line per module row. This deliberately
     avoids every Unicode block-drawing glyph (U+2580 "▀", U+2588 "█", etc.):
     those exist in some legacy Windows OEM codepages (437) but not others
     (1252), and even when the codepage matches, the classic "Raster Fonts"
@@ -442,9 +442,14 @@ def render_ascii(matrix: list[list[int]], quiet_zone: int = _QUIET_ZONE) -> str:
     own fixed set -- an unmapped Unicode code point renders as a broken glyph
     there regardless of encoding, which silently corrupts the module grid a
     scanner needs. Plain ASCII `#`/space has no such dependency: every
-    console font maps it correctly. The cost is a taller printout (roughly
-    double a half-block rendering), which is a small price for reliably
-    scanning.
+    console font maps it correctly.
+
+    A single character per module makes each module narrower than it is
+    tall in most monospace fonts, rather than the square a two-character
+    width would give -- deliberately traded away to keep the printout
+    compact, since real scanners tolerate that skew fine in practice. The
+    quiet zone (spec minimum 4 modules -- see _QUIET_ZONE) is untouched:
+    that one is load-bearing, not cosmetic.
     """
     size = len(matrix)
     padded_size = size + quiet_zone * 2
@@ -455,7 +460,7 @@ def render_ascii(matrix: list[list[int]], quiet_zone: int = _QUIET_ZONE) -> str:
 
     lines = []
     for row in padded:
-        lines.append("".join("##" if cell else "  " for cell in row))
+        lines.append("".join("#" if cell else " " for cell in row))
     return "\n".join(lines)
 
 
