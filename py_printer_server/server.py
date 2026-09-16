@@ -1511,6 +1511,22 @@ document.getElementById("delete-all-btn").onclick = () => deleteFolders(allFolde
 </html>"""
 
 
+def _print_qr(url: str) -> None:
+    """Print a scannable QR code for `url`.
+
+    Uses render_ascii()'s plain 7-bit rendering -- see its docstring for why
+    this is the one configuration confirmed to both scan correctly and print
+    as a square grid, and why a smaller or Unicode-packed rendering was
+    tried and rolled back rather than kept as the default.
+    """
+    from py_printer_server.qrcode_ascii import qr_ascii
+
+    try:
+        print(qr_ascii(url))
+    except ValueError as exc:
+        logger.warning("could not build QR code: %s", exc)
+
+
 def main() -> int:
     global PORT, SPOOL_DIR, JOBS_DIR, job_queue
 
@@ -1574,11 +1590,7 @@ def main() -> int:
         print(f"Print Server: http://localhost:{PORT}")
         print(f"From another device on this network: {url}")
         if not args.no_qr:
-            try:
-                from py_printer_server.qrcode_ascii import qr_ascii
-                print(qr_ascii(url))
-            except (UnicodeEncodeError, ValueError) as exc:
-                logger.warning("could not render QR code: %s", exc)
+            _print_qr(url)
         if args.dry_run:
             print("DRY RUN: jobs will be logged, not sent to a printer.")
         try:
