@@ -94,3 +94,39 @@ def test_login_page_template_renders():
     srv.Handler.login_page(handler, "Invalid password.")
     assert "Invalid password." in captured["html"]
     assert "{{" not in captured["html"]
+
+
+def test_archive_page_template_renders():
+    """Same str.format brace-escaping trap as the main page template."""
+    from py_printer_server.server import _ARCHIVE_PAGE_TEMPLATE
+    html = _ARCHIVE_PAGE_TEMPLATE.format(csrf="tok", rows="", empty_notice="")
+    assert "<title>Archived Jobs</title>" in html
+    assert 'const CSRF = "tok"' in html
+    assert "{{" not in html and "}}" not in html
+
+
+class TestTranslateJobDir:
+    def _translate(self, name):
+        from py_printer_server import server as srv
+        handler = object.__new__(srv.Handler)
+        return srv.Handler.translate_job_dir(handler, name)
+
+    def test_accepts_plain_folder_name(self, tmp_path, monkeypatch):
+        from py_printer_server import server as srv
+        monkeypatch.setattr(srv, "JOBS_DIR", str(tmp_path))
+        result = self._translate("print-job-20260101-000000-abc123")
+        assert result == str(tmp_path / "print-job-20260101-000000-abc123")
+
+    def test_rejects_traversal(self, tmp_path, monkeypatch):
+        from py_printer_server import server as srv
+        monkeypatch.setattr(srv, "JOBS_DIR", str(tmp_path))
+        assert self._translate("../outside") is None
+        assert self._translate("..\\outside") is None
+        assert self._translate("sub/dir") is None
+
+    def test_rejects_empty_and_dotted(self, tmp_path, monkeypatch):
+        from py_printer_server import server as srv
+        monkeypatch.setattr(srv, "JOBS_DIR", str(tmp_path))
+        assert self._translate("") is None
+        assert self._translate(".") is None
+        assert self._translate("..") is None

@@ -318,6 +318,26 @@ class Handler(http.server.SimpleHTTPRequestHandler):
             return None
         return full
 
+    def translate_job_dir(self, name: str) -> str | None:
+        """Resolve a user-supplied archive folder name against JOBS_DIR.
+
+        Same traversal guard as translate_name: reject anything that is not
+        exactly its own basename, rather than merely normalising it. These
+        names arrive from a network client requesting a permanent delete, so
+        there is no room for "probably fine".
+        """
+        if not name or name in (".", ".."):
+            return None
+        if "/" in name or "\\" in name or os.path.basename(name) != name:
+            return None
+        if any(ch in name for ch in ':*?"<>|') or "\x00" in name:
+            return None
+        full = os.path.normpath(os.path.join(JOBS_DIR, name))
+        base = os.path.normpath(JOBS_DIR)
+        if full != base and not full.startswith(base + os.sep):
+            return None
+        return full
+
     def _read_exactly(self, length: int) -> bytes:
         chunks: list[bytes] = []
         remaining = length
@@ -509,6 +529,58 @@ button {{ width: 100%; padding: 12px; border: none; background: var(--accent); b
         )
         self.send_html(html)
 
+    def archive_page(self) -> None:
+        """Render the archived-jobs page: one row per printed-job folder."""
+        if not self.is_admin():
+            self.redirect("/login")
+            return
+        csrf = self._csrf_token() or ""
+
+        entries = []
+        try:
+            for name in sorted(os.listdir(JOBS_DIR), key=str.lower, reverse=True):
+                full = os.path.join(JOBS_DIR, name)
+                if not os.path.isdir(full):
+                    continue
+                file_count = 0
+                total_size = 0
+                for root, _dirs, files in os.walk(full):
+                    for fname in files:
+                        file_count += 1
+                        try:
+                            total_size += os.path.getsize(os.path.join(root, fname))
+                        except OSError:
+                            pass
+                mtime = os.stat(full).st_mtime
+                entries.append((name, file_count, total_size, mtime))
+        except OSError as exc:
+            logger.warning("cannot list jobs dir %s: %s", JOBS_DIR, exc)
+
+        rows = ""
+        for name, file_count, total_size, mtime in entries:
+            mtime_str = time.strftime("%Y-%m-%d %H:%M", time.localtime(mtime))
+            rows += f"""
+        <tr class="archive-row" data-name="{_html_escape(name)}">
+            <td><input type="checkbox" class="archive-check" value="{_html_escape(name)}"></td>
+            <td>{_html_escape(name)}</td>
+            <td>{file_count}</td>
+            <td>{human(total_size)}</td>
+            <td>{mtime_str}</td>
+            <td><button class="btn-small archive-delete-btn" data-name="{_html_escape(name)}">🗑</button></td>
+        </tr>"""
+
+        empty_notice = (
+            '<tr><td colspan="6" class="empty-notice">No archived jobs yet.</td></tr>'
+            if not entries else ""
+        )
+
+        html = _ARCHIVE_PAGE_TEMPLATE.format(
+            csrf=csrf,
+            rows=rows,
+            empty_notice=empty_notice,
+        )
+        self.send_html(html)
+
     # ------------------------------------------------------------------
     # GET handler
     # ------------------------------------------------------------------
@@ -533,6 +605,10 @@ button {{ width: 100%; padding: 12px; border: none; background: var(--accent); b
 
         if request_path == "/":
             self.main_page()
+            return
+
+        if request_path == "/archive":
+            self.archive_page()
             return
 
         if request_path == "/printers":
@@ -642,7 +718,7 @@ button {{ width: 100%; padding: 12px; border: none; background: var(--accent); b
             self._handle_upload(length, content_type, client_ip)
             return
 
-        if request_path in ("/print", "/delete", "/settings"):
+        if request_path in ("/print", "/delete", "/settings", "/archive/delete"):
             if length > SMALL_BODY_LIMIT:
                 self.send_error_text(413, "Request body too large")
                 return
@@ -650,6 +726,8 @@ button {{ width: 100%; padding: 12px; border: none; background: var(--accent); b
                 self._handle_print(length, client_ip)
             elif request_path == "/delete":
                 self._handle_delete(length, client_ip)
+            elif request_path == "/archive/delete":
+                self._handle_archive_delete(length, client_ip)
             else:
                 self._handle_settings(length, client_ip)
             return
@@ -814,6 +892,56 @@ button {{ width: 100%; padding: 12px; border: none; background: var(--accent); b
         os.remove(path)
         self.log_event("DELETE", client_ip, name, size)
         self.send_json({"ok": True})
+
+    def _handle_archive_delete(self, length: int, client_ip: str) -> None:
+        """Permanently remove one or more archived-job folders from JOBS_DIR.
+
+        Unlike /delete (one spool file, still unprinted), this destroys
+        already-printed job records with no retry path -- every name is
+        validated before anything is removed, so a request naming one bad
+        folder deletes nothing rather than deleting everything before it.
+        """
+        if not self._validate_csrf():
+            self.send_error_text(403, "Invalid or missing CSRF token")
+            return
+        body = self._read_exactly(length)
+        try:
+            payload = json.loads(body.decode("utf-8"))
+        except (ValueError, UnicodeDecodeError):
+            self.send_error_text(400, "Invalid JSON body")
+            return
+
+        names = payload.get("folders") or []
+        if not isinstance(names, list) or not names:
+            self.send_error_text(400, "No archive folders selected")
+            return
+
+        resolved: list[tuple[str, str]] = []
+        for name in names:
+            path = self.translate_job_dir(str(name))
+            if path is None or not os.path.isdir(path):
+                self.send_error_text(400, f"Invalid or missing archive folder: {name!r}")
+                return
+            resolved.append((str(name), path))
+
+        removed: list[str] = []
+        errors: list[str] = []
+        for name, path in resolved:
+            try:
+                shutil.rmtree(path)
+                removed.append(name)
+                self.log_event("ARCHIVE_DELETE", client_ip, name, 0)
+            except OSError as exc:
+                errors.append(f"{name}: {exc}")
+                logger.warning("could not remove archive folder %s: %s", path, exc)
+
+        if errors:
+            self.send_json(
+                {"ok": False, "removed": removed, "errors": errors},
+                status=207 if removed else 500,
+            )
+        else:
+            self.send_json({"ok": True, "removed": removed})
 
     def _handle_settings(self, length: int, client_ip: str) -> None:
         """Persist default print options to config.json."""
@@ -986,6 +1114,9 @@ _MAIN_PAGE_TEMPLATE = """<!DOCTYPE html>
 body {{ margin: 0; background: var(--bg); color: var(--text); font-family: 'Segoe UI', sans-serif; padding: 16px; }}
 .wrap {{ max-width: 900px; margin: 0 auto; }}
 h1 {{ font-size: 20px; margin: 0 0 16px; }}
+.nav-link {{ margin: -8px 0 16px; font-size: 13px; }}
+.nav-link a {{ color: var(--accent); text-decoration: none; }}
+.nav-link a:hover {{ text-decoration: underline; }}
 .panel {{ background: var(--surface); border: 1px solid var(--border); border-radius: 14px; padding: 18px; margin-bottom: 16px; }}
 .drop {{ border: 2px dashed var(--border); border-radius: 10px; padding: 28px; text-align: center; color: var(--text-muted); margin-bottom: 12px; }}
 .drop.drag {{ border-color: var(--accent); color: var(--accent); }}
@@ -1015,6 +1146,7 @@ th {{ color: var(--text-muted); font-weight: 600; font-size: 12px; text-transfor
 <body>
 <div class="wrap">
     <h1>🖨️ Print Server</h1>
+    <div class="nav-link"><a href="/archive">📁 Archived jobs</a></div>
 
     <div class="panel">
         <div class="drop" id="drop">Drag &amp; drop files here to add them to the print spool</div>
@@ -1248,6 +1380,128 @@ async function refreshJobs() {{
 }}
 refreshJobs();
 setInterval(refreshJobs, 4000);
+</script>
+</body>
+</html>"""
+
+
+_ARCHIVE_PAGE_TEMPLATE = """<!DOCTYPE html>
+<html>
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Archived Jobs</title>
+<style>
+:root {{
+    --bg: #0f172a; --surface: #1e293b; --surface2: #334155;
+    --text: #e2e8f0; --text-muted: #94a3b8; --border: #334155;
+    --accent: #3b82f6; --danger: #f87171; --success: #34d399;
+}}
+[data-theme="light"] {{
+    --bg: #f1f5f9; --surface: #ffffff; --surface2: #f8fafc;
+    --text: #1e293b; --text-muted: #64748b; --border: #e2e8f0;
+    --accent: #2563eb; --danger: #dc2626; --success: #16a34a;
+}}
+* {{ box-sizing: border-box; }}
+body {{ margin: 0; background: var(--bg); color: var(--text); font-family: 'Segoe UI', sans-serif; padding: 16px; }}
+.wrap {{ max-width: 900px; margin: 0 auto; }}
+h1 {{ font-size: 20px; margin: 0 0 16px; }}
+.nav-link {{ margin: -8px 0 16px; font-size: 13px; }}
+.nav-link a {{ color: var(--accent); text-decoration: none; }}
+.nav-link a:hover {{ text-decoration: underline; }}
+.panel {{ background: var(--surface); border: 1px solid var(--border); border-radius: 14px; padding: 18px; margin-bottom: 16px; }}
+table {{ width: 100%; border-collapse: collapse; font-size: 14px; }}
+th, td {{ padding: 8px; text-align: left; border-bottom: 1px solid var(--border); }}
+th {{ color: var(--text-muted); font-weight: 600; font-size: 12px; text-transform: uppercase; }}
+.empty-notice {{ text-align: center; color: var(--text-muted); padding: 24px; }}
+.btn-small {{ background: none; border: 1px solid var(--border); border-radius: 6px; padding: 4px 8px; cursor: pointer; color: var(--text); }}
+.select-bar {{ display: flex; gap: 8px; margin-bottom: 10px; flex-wrap: wrap; }}
+.select-bar button {{ background: var(--surface2); border: 1px solid var(--border); border-radius: 6px; padding: 6px 10px; cursor: pointer; color: var(--text); font-size: 13px; }}
+.action-bar {{ display: flex; gap: 10px; margin-top: 14px; flex-wrap: wrap; align-items: center; }}
+.action-bar button {{ border: none; border-radius: 8px; padding: 10px 16px; cursor: pointer; font-size: 14px; color: white; }}
+#delete-selected-btn {{ background: var(--danger); }}
+#delete-all-btn {{ background: var(--danger); opacity: 0.85; }}
+.status-line {{ font-size: 12px; color: var(--text-muted); margin-top: 6px; }}
+</style>
+</head>
+<body>
+<div class="wrap">
+    <h1>📁 Archived Jobs</h1>
+    <div class="nav-link"><a href="/">← Back to Print Server</a></div>
+
+    <div class="panel">
+        <div class="select-bar">
+            <button id="select-all">Select all</button>
+            <button id="select-none">Select none</button>
+            <button id="select-invert">Invert</button>
+        </div>
+        <table>
+            <thead><tr><th></th><th>Folder</th><th>Files</th><th>Size</th><th>Printed</th><th></th></tr></thead>
+            <tbody id="archive-table-body">{empty_notice}{rows}</tbody>
+        </table>
+        <div class="action-bar">
+            <button id="delete-selected-btn">🗑 Delete selected</button>
+            <button id="delete-all-btn">🗑 Delete all</button>
+        </div>
+        <div class="status-line" id="archive-status"></div>
+    </div>
+</div>
+
+<script>
+const CSRF = "{csrf}";
+
+function setTheme() {{
+    const t = localStorage.getItem("theme") || "dark";
+    document.documentElement.setAttribute("data-theme", t);
+}}
+setTheme();
+
+async function api(path, opts) {{
+    opts = opts || {{}};
+    opts.headers = Object.assign({{"X-CSRF-Token": CSRF}}, opts.headers || {{}});
+    return fetch(path, opts);
+}}
+
+function archiveCheckboxes() {{ return Array.from(document.querySelectorAll(".archive-check")); }}
+document.getElementById("select-all").onclick = () => archiveCheckboxes().forEach(c => c.checked = true);
+document.getElementById("select-none").onclick = () => archiveCheckboxes().forEach(c => c.checked = false);
+document.getElementById("select-invert").onclick = () => archiveCheckboxes().forEach(c => c.checked = !c.checked);
+
+function selectedFolders() {{ return archiveCheckboxes().filter(c => c.checked).map(c => c.value); }}
+function allFolders() {{ return archiveCheckboxes().map(c => c.value); }}
+
+const status = document.getElementById("archive-status");
+
+async function deleteFolders(folders) {{
+    if (!folders.length) {{
+        status.textContent = "Nothing selected.";
+        return;
+    }}
+    const label = folders.length === 1 ? folders[0] : folders.length + " archived job folder(s)";
+    if (!confirm("Permanently delete " + label + "? This cannot be undone.")) return;
+    status.textContent = "Deleting...";
+    try {{
+        const resp = await api("/archive/delete", {{
+            method: "POST",
+            headers: {{"Content-Type": "application/json"}},
+            body: JSON.stringify({{folders: folders}}),
+        }});
+        if (resp.ok || resp.status === 207) {{
+            location.reload();
+        }} else {{
+            const text = await resp.text();
+            status.textContent = "Delete failed: " + text;
+        }}
+    }} catch (err) {{
+        status.textContent = "Delete failed: " + err;
+    }}
+}}
+
+document.querySelectorAll(".archive-delete-btn").forEach(btn => {{
+    btn.onclick = () => deleteFolders([btn.dataset.name]);
+}});
+document.getElementById("delete-selected-btn").onclick = () => deleteFolders(selectedFolders());
+document.getElementById("delete-all-btn").onclick = () => deleteFolders(allFolders());
 </script>
 </body>
 </html>"""
