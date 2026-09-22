@@ -13,12 +13,16 @@ Remote print server for a USB-connected printer. This repo follows the
 
 ## Project-specific notes
 
-- **Zero third-party dependencies**, deliberately, matching the companion
-  project `D:\GitHub\file-share` (PyPI `py-file-server`). Win32 printer access
-  goes through hand-written `ctypes` bindings in `py_printer_server/winspool.py`,
-  not `pywin32`. Do not add `pywin32`, Pillow, ReportLab, or `qrcode` without
-  discussing it first -- that constraint was a deliberate user decision, not
-  an oversight.
+- **Two dependencies, both required: Pillow and pypdfium2.** Added in 0.5.0
+  because per-job colour control is impossible without rendering pages
+  ourselves: handing a file to Windows' own handler cannot carry a devmode.
+  **Everything else stays stdlib-only** -- HTTP, LAN discovery, mDNS, QR and
+  all Win32 access. `mdns.py` and `qrcode_ascii.py` exist *because* of that
+  rule and stay hand-written; do not replace them with a library now that the
+  door is ajar. `pywin32` in particular stays rejected: `winspool.py` already
+  does its job, and it would duplicate a tested layer with a fragile install.
+  The companion file-share project remains zero-dependency; this repo no longer
+  matches it, so do not cite it as precedent here.
 - **Windows-only.** `winspool.py` raises at import time on any other platform.
   Keep that import out of module scope in `server.py` so the rest of the test
   suite can still run (or at least collect) on a non-Windows CI runner if one
@@ -52,6 +56,36 @@ Remote print server for a USB-connected printer. This repo follows the
   in its embedded CSS/JS must be doubled. A stray single brace raises at
   request time, not import time, so the UI 500s while unit tests still pass.
   `tests/test_server.py` renders both templates to catch this.
+- **A DEVMODE that is built is not a DEVMODE that is applied.** Until 0.5.0
+  `PrinterSession` built a perfectly correct devmode and then handed it to
+  nothing: `open_printer` passed `pDevMode=None` and `session.devmode` was read
+  nowhere, so every job printed at the printer's standing defaults and
+  unchecking Colour did nothing. When a setting appears not to work, check in
+  this order: (1) did the devmode reach `OpenPrinterW`'s `PRINTER_DEFAULTS` or
+  `CreateDCW`'s `lpInitData`, (2) is the field's `dmFields` bit set, (3) did
+  `DocumentPropertiesW` clamp it (`devmode.unapplied_settings` reports this).
+  The old note sent readers straight to (2), the one part already correct.
+- **The settings logic lives in `devmode.py`, which imports no ctypes**, so it
+  is testable off Windows. `winspool.py` re-exports its constants, so
+  `winspool.DM_COLOR` still works. `pagelayout.py` is the same idea for the
+  fit-to-page geometry.
+- **Do not let GDI shrink a bitmap.** Its default stretch mode is
+  `BLACKONWHITE`, which discards pixels rather than averaging them, and
+  Pillow's `Dib.draw` never calls `SetStretchBltMode`. `render._resample_for`
+  downscales with LANCZOS first so GDI only ever enlarges. A photo left for GDI
+  to shrink prints as noise, and nothing errors.
+- **Normalise every image before `ImageWin.Dib`**: P-mode raises outright, and
+  `RGBA.convert("RGB")` drops alpha without compositing, so a transparent
+  background prints as a solid black rectangle. `render.to_printable` is the
+  one funnel that handles both, plus the greyscale conversion.
+- **Mono is enforced twice on purpose**: `dmColor = DMCOLOR_MONOCHROME` *and* a
+  greyscale raster. The devmode is the correct mechanism, but the bug that
+  prompted this was a setting being ignored downstream, and a grey raster
+  cannot come out coloured whatever the driver does. It also keeps colour ink
+  off the page on an ink-tank device that would otherwise mix composite black.
+- **`DC_COLORDEVICE` is 32, not 6.** It was 6 (which is `DC_BINS`), so
+  `supports_color` was reading the paper-bin count, and a comment in
+  `printers.py` rationalised that as a driver quirk.
 - **The discovery wire format is frozen.** `py_printer_server/discovery.py` and
   `PROTOCOL.md` are the contract with the Android client in
   `D:/GitHub/android-printer-client`. The shared test vectors in
@@ -83,9 +117,11 @@ Remote print server for a USB-connected printer. This repo follows the
   ever drop that binding, drop `SESSION_TTL` back to hours in the same commit.
 - **`sessions.json` must stay in `_HIDDEN_SPOOL_NAMES`.** It lives in the spool
   folder and holds live tokens; listing it would also make it downloadable.
-- The full design rationale, trade-offs (no PDF rendering, no per-job
-  duplex/colour control for Office files, why SumatraPDF and pywin32 were
-  rejected) is in the plan file this repo was built from:
+- Office files still have no per-job duplex/colour control, because they are
+  handed to Word/Excel/PowerPoint. That gap is now reported per file on the job
+  record (`JobFile.settings`) rather than claimed away in a blanket sentence.
+  The original design rationale (why SumatraPDF and pywin32 were rejected) is
+  in the plan file this repo was built from:
   `C:\Users\kpandiyaraj\.claude\plans\i-have-files-on-merry-dolphin.md`.
 
 ## Testing

@@ -10,8 +10,11 @@ knows how to print this file type":
 
 - plain text/code: we write it to the spooler ourselves (full control over
   pagination, but only this one format).
-- PDF and images: handed to whatever program Windows has associated with that
-  extension, via the shell's ``printto`` verb.
+- PDF and images: decoded here (Pillow, and pdfium for PDF) and drawn onto a
+  printer device context built from this job's devmode. They used to be handed
+  to whatever program Windows associated with the extension, via the shell's
+  ``printto`` verb, but that path cannot carry a devmode, so every print
+  setting was silently discarded.
 - Office documents: same shell verb, letting Word/Excel/PowerPoint do the
   printing. No COM automation, so no ability to set duplex/colour on a
   per-job basis for these; they print with the printer's standing defaults.
@@ -30,9 +33,14 @@ TEXT_SUFFIXES = frozenset({
     ".txt", ".log", ".csv", ".md", ".py", ".json", ".xml", ".ini",
     ".yaml", ".yml", ".cfg", ".conf", ".ps1", ".sh", ".bat",
 })
-SHELL_IMAGE_SUFFIXES = frozenset({
-    ".pdf", ".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp", ".gif",
+# Rendered in-process, so print settings actually apply to them.
+IMAGE_SUFFIXES = frozenset({
+    ".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp", ".gif",
 })
+PDF_SUFFIXES = frozenset({".pdf"})
+
+# Kept as an alias: these are the suffixes that USED to go to the shell.
+SHELL_IMAGE_SUFFIXES = IMAGE_SUFFIXES | PDF_SUFFIXES
 OFFICE_SUFFIXES = frozenset({
     ".doc", ".docx", ".xls", ".xlsx", ".ppt", ".pptx",
 })
@@ -43,6 +51,9 @@ _SNIFF_BYTES = 4096
 
 class PrintRoute(Enum):
     RAW_TEXT = "raw_text"
+    # Decoded and drawn by this server onto a device context built from the
+    # job's own devmode, which is what makes colour/copies/duplex real.
+    RENDERED = "rendered"
     SHELL_VERB = "shell_verb"
     OFFICE_COM = "office_com"  # handled via the same shell verb, kept as a
                                 # distinct label so the UI can explain the
@@ -82,8 +93,11 @@ def route(src: Path) -> RouteDecision:
     if suffix in TEXT_SUFFIXES:
         return RouteDecision(PrintRoute.RAW_TEXT, "recognised text/code extension")
 
-    if suffix in SHELL_IMAGE_SUFFIXES:
-        return RouteDecision(PrintRoute.SHELL_VERB, "PDF/image, printed via the shell handler")
+    if suffix in IMAGE_SUFFIXES:
+        return RouteDecision(PrintRoute.RENDERED, "image, rendered and printed by this server")
+
+    if suffix in PDF_SUFFIXES:
+        return RouteDecision(PrintRoute.RENDERED, "PDF, rendered and printed by this server")
 
     if suffix in OFFICE_SUFFIXES:
         return RouteDecision(

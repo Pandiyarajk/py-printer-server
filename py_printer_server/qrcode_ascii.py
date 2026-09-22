@@ -1,6 +1,7 @@
 """Minimal, hand-rolled QR code generator for printing a LAN URL to the console.
 
-Zero third-party dependency, matching the rest of this project (winspool.py
+No third-party dependency, matching the rest of this project outside the
+rendering path (winspool.py
 hand-rolls ctypes bindings instead of pulling in pywin32; this hand-rolls the
 same category of primitive -- Reed-Solomon over GF(256) and BCH format/version
 bits -- instead of pulling in `qrcode`).

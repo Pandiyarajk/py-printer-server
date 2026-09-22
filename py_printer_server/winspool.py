@@ -68,8 +68,16 @@ PRINTER_ACCESS_USE = 0x00000008
 STANDARD_RIGHTS_READ = 0x00020000
 PRINTER_ALL_ACCESS = 0x000F000C  # STANDARD_RIGHTS_REQUIRED | ADMINISTER | USE
 
-DC_COLORDEVICE = 6
+# DeviceCapabilitiesW indices (wingdi.h). DC_COLORDEVICE is 32; it was 6 here,
+# which is DC_BINS, so supports_color() was reading the paper-bin count. It
+# happened to give the right answer on an HP with 2 bins (nonzero -> "colour"),
+# and the resulting "some drivers return other nonzero values" note in
+# printers.py was a misdiagnosis of this bug rather than a driver quirk.
+DC_FIELDS = 1
+DC_BINS = 6
 DC_DUPLEX = 7
+DC_COPIES = 18
+DC_COLORDEVICE = 32
 
 # DocumentPropertiesW flags (wingdi.h). DM_OUT_BUFFER asks the driver to fill
 # our buffer with its current settings; DM_IN_BUFFER asks it to validate and
@@ -81,21 +89,24 @@ DM_MODIFY = 8
 DM_OUT_BUFFER = DM_COPY
 DM_IN_BUFFER = DM_MODIFY
 
-DM_COLOR = 0x00000800
-DM_DUPLEX = 0x00001000
-DM_PAPERSIZE = 0x00000002
-DM_COPIES = 0x00000100
-DM_ORIENTATION = 0x00000001
-
-DMCOLOR_MONOCHROME = 1
-DMCOLOR_COLOR = 2
-
-DMDUP_SIMPLEX = 1
-DMDUP_VERTICAL = 2
-
-DMPAPER_A4 = 9
-
-DMORIENT_PORTRAIT = 1
+# Re-exported from the pure module so winspool.DM_COLOR and friends keep
+# working for existing callers, while the settings logic stays importable on a
+# machine that has no winspool.drv to load.
+from py_printer_server.devmode import (  # noqa: E402,F401
+    DM_COLOR,
+    DM_COPIES,
+    DM_DUPLEX,
+    DM_ORIENTATION,
+    DM_PAPERSIZE,
+    DM_PRINTQUALITY,
+    DMCOLOR_COLOR,
+    DMCOLOR_MONOCHROME,
+    DMDUP_SIMPLEX,
+    DMDUP_VERTICAL,
+    DMORIENT_PORTRAIT,
+    DMPAPER_A4,
+    DMPAPER_LETTER,
+)
 
 SW_HIDE = 0
 SE_ERR_NOASSOC = 31
@@ -142,7 +153,7 @@ class DEVMODEW(Structure):
         ("dmTTOption", c_short),
         ("dmCollate", c_short),
         ("dmFormName", c_wchar * CCHFORMNAME),
-        ("dmLogPixels", c_ulong),
+        ("dmLogPixels", c_short),   # WORD in wingdi.h, not DWORD
         ("dmBitsPerPel", c_ulong),
         ("dmPelsWidth", c_ulong),
         ("dmPelsHeight", c_ulong),
@@ -208,7 +219,7 @@ class PRINTER_DEFAULTS(Structure):
 
     _fields_ = [
         ("pDatatype", c_wchar_p),
-        ("pDevMode", c_void_p),
+        ("pDevMode", POINTER(DEVMODEW)),
         ("DesiredAccess", c_ulong),
     ]
 
@@ -394,16 +405,28 @@ def get_default_printer() -> str | None:
     return buf.value or None
 
 
-def open_printer(name: str, access: int = PRINTER_ACCESS_USE) -> c_void_p:
+def open_printer(
+    name: str, access: int = PRINTER_ACCESS_USE, devmode=None
+) -> c_void_p:
     """Open a printer handle with the requested access level.
 
     `access` must actually be threaded through a PRINTER_DEFAULTS struct --
     passing NULL for the third argument silently grants a lower default
     access level regardless of what the caller asked for, which surfaces
     later as ERROR_ACCESS_DENIED (5) from SetPrinterW rather than here.
+
+    `devmode` is a POINTER(DEVMODEW) from build_job_devmode, or None for the
+    printer's standing defaults. **This is the only point at which per-job
+    settings can enter a spooler handle**: StartDocPrinterW takes no devmode,
+    so one built after the handle was opened reaches nothing at all. That was
+    the bug behind "the server always prints in colour" -- the devmode was
+    built correctly and then discarded.
+
+    The caller owns the backing buffer and must keep it referenced for the life
+    of the handle.
     """
     handle = c_void_p()
-    defaults = PRINTER_DEFAULTS(pDatatype=None, pDevMode=None, DesiredAccess=access)
+    defaults = PRINTER_DEFAULTS(pDatatype=None, pDevMode=devmode, DesiredAccess=access)
     ok = winspool.OpenPrinterW(name, byref(handle), byref(defaults))
     _check(ok, f"OpenPrinterW({name!r}, access={access:#x})")
     return handle
@@ -573,3 +596,96 @@ def shell_print_to(printer_name: str, file_path: str) -> int:
         )
         return code
     return 33
+
+
+# ---------------------------------------------------------------------------
+# GDI printing  (gdi32)
+#
+# The shell's "printto" verb cannot carry a devmode: the handler it launches
+# builds its own, so colour/copies/duplex follow the printer's standing
+# defaults no matter what the user chose. Printing the page ourselves through a
+# device context created FROM our devmode is the only way those settings can
+# apply to an image.
+# ---------------------------------------------------------------------------
+
+gdi32 = ctypes.WinDLL("gdi32", use_last_error=True)
+
+# GetDeviceCaps indices (wingdi.h)
+HORZRES = 8
+VERTRES = 10
+LOGPIXELSX = 88
+LOGPIXELSY = 90
+PHYSICALWIDTH = 110
+PHYSICALHEIGHT = 111
+PHYSICALOFFSETX = 112
+PHYSICALOFFSETY = 113
+
+
+class DOCINFOW(Structure):
+    """Not DOC_INFO_1W. Different API (gdi32, not winspool.drv) and a different
+    layout: this one is cbSize-prefixed.
+
+    lpszDatatype must stay NULL. Copying the "TEXT" datatype from the spooler
+    path would break EMF spooling, because that is a winspool concept.
+    """
+
+    _fields_ = [
+        ("cbSize", c_int),
+        ("lpszDocName", c_wchar_p),
+        ("lpszOutput", c_wchar_p),
+        ("lpszDatatype", c_wchar_p),
+        ("fwType", c_ulong),
+    ]
+
+
+# restype c_void_p matters: with the default int restype a 64-bit handle is
+# truncated, and the failure looks like a bad DC rather than a binding error.
+gdi32.CreateDCW.argtypes = [c_wchar_p, c_wchar_p, c_wchar_p, POINTER(DEVMODEW)]
+gdi32.CreateDCW.restype = c_void_p
+gdi32.DeleteDC.argtypes = [c_void_p]
+gdi32.DeleteDC.restype = c_int
+gdi32.GetDeviceCaps.argtypes = [c_void_p, c_int]
+gdi32.GetDeviceCaps.restype = c_int
+gdi32.StartDocW.argtypes = [c_void_p, POINTER(DOCINFOW)]
+gdi32.StartDocW.restype = c_int
+gdi32.StartPage.argtypes = [c_void_p]
+gdi32.StartPage.restype = c_int
+gdi32.EndPage.argtypes = [c_void_p]
+gdi32.EndPage.restype = c_int
+gdi32.EndDoc.argtypes = [c_void_p]
+gdi32.EndDoc.restype = c_int
+gdi32.AbortDoc.argtypes = [c_void_p]
+gdi32.AbortDoc.restype = c_int
+
+
+def create_printer_dc(printer_name: str, devmode) -> c_void_p:
+    """Create a device context for `printer_name` carrying `devmode`.
+
+    Passing the devmode as lpInitData is what makes the per-job settings real
+    for anything drawn on this DC.
+    """
+    hdc = gdi32.CreateDCW(None, printer_name, None, devmode)
+    if not hdc:
+        raise WinspoolError(
+            f"CreateDCW failed for {printer_name!r}: {get_last_error()}"
+        )
+    return c_void_p(hdc)
+
+
+def get_page_geometry(hdc: c_void_p):
+    """Read the sheet and printable-area measurements from a printer DC."""
+    from py_printer_server.pagelayout import PageGeometry
+
+    def cap(index: int) -> int:
+        return gdi32.GetDeviceCaps(hdc, index)
+
+    return PageGeometry(
+        phys_width=cap(PHYSICALWIDTH),
+        phys_height=cap(PHYSICALHEIGHT),
+        offset_x=cap(PHYSICALOFFSETX),
+        offset_y=cap(PHYSICALOFFSETY),
+        printable_width=cap(HORZRES),
+        printable_height=cap(VERTRES),
+        dpi_x=cap(LOGPIXELSX),
+        dpi_y=cap(LOGPIXELSY),
+    )

@@ -6,5 +6,5 @@ Date: Sep-14-2026
 
 from py_printer_server.server import main
 
-__version__ = "0.4.0"
+__version__ = "0.5.0"
 __all__ = ["main", "__version__"]

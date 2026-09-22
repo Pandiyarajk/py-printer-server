@@ -60,9 +60,9 @@ def supports_color(name: str, port: str) -> bool:
     result = winspool.device_capabilities(name, port, winspool.DC_COLORDEVICE)
     if result < 0:
         return True
-    # DC_COLORDEVICE's contract is "nonzero means colour-capable", not
-    # specifically 1 -- some drivers (confirmed on an HP inkjet) return other
-    # nonzero values, so treat any nonzero as True rather than matching 1.
+    # Nonzero means colour-capable. There used to be a note here claiming some
+    # drivers return "other nonzero values"; that was this function reading
+    # DC_BINS (6) instead of DC_COLORDEVICE (32) and seeing a paper-bin count.
     return result != 0
 
 

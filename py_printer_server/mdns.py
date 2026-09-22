@@ -8,8 +8,9 @@ NsdManager, and no more. Pure wire-format logic: this module opens no socket, so
 every byte layout below is unit-testable on any OS. The socket and thread live
 in discovery_net.MdnsAdvertiser.
 
-Zero third-party dependencies is a hard constraint for this project, so there is
-no zeroconf here. The cost is roughly three hundred lines of DNS, which is
+Nothing outside the standard library here. Rendering aside (Pillow and
+pypdfium2, added in 0.5.0), this project stays stdlib-only, so there is no
+zeroconf. The cost is roughly three hundred lines of DNS, which is
 exactly why mDNS is opt-in while the UDP beacon is on by default: the beacon
 already delivers the feature, and this is a convenience for clients that prefer
 DNS-SD.

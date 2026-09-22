@@ -20,7 +20,7 @@ from py_printer_server import winspool
 # quoted in older documentation -- Windows headers have grown the struct
 # over time, so this asserts internal consistency (the layout doesn't drift
 # once fixed) rather than a canonical constant.
-EXPECTED_DEVMODEW_SIZE = 224
+EXPECTED_DEVMODEW_SIZE = 220
 
 
 def test_devmodew_size_matches_measured_layout() -> None:

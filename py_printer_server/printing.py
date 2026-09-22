@@ -19,6 +19,7 @@ from dataclasses import asdict, dataclass, field
 from datetime import datetime
 from pathlib import Path
 
+from py_printer_server import devmode as devmode_mod
 from py_printer_server import winspool
 from py_printer_server.printroute import PrintRoute, route
 
@@ -62,6 +63,11 @@ class JobFile:
     name: str
     status: str = "queued"  # queued | printing | done | error | unsupported
     detail: str = ""
+    # Whether this file's colour/copies/duplex choices actually reached the
+    # printer. "ignored" is the honest answer for anything handed to another
+    # program to print, which cannot carry our devmode.
+    settings: str = "unknown"  # applied | ignored | partial
+    settings_detail: str = ""
 
 
 @dataclass
@@ -97,15 +103,43 @@ class PrinterSession:
         self._handle = None
         self.devmode = None
         self._devmode_buf = None
+        self.unapplied: list[str] = []
 
     def __enter__(self) -> "PrinterSession":
+        # Two opens, unavoidably. DocumentPropertiesW needs a handle to build
+        # the devmode, but PRINTER_DEFAULTS.pDevMode is consumed at
+        # OpenPrinterW time, so the devmode cannot be attached to the handle
+        # that produced it. Probe handle first, then reopen carrying the result.
+        #
+        # The previous version did only the first open and kept pDevMode=None,
+        # so the devmode it carefully built reached nothing and every job used
+        # the printer's standing defaults. That is why unchecking Colour did
+        # nothing.
+        #
         # __exit__ is NOT called when __enter__ raises, so anything acquired
         # here must be released on the failure path explicitly or it leaks for
         # the life of the (long-lived) worker thread.
-        self._handle = winspool.open_printer(self._printer_name, winspool.PRINTER_ACCESS_USE)
+        probe = winspool.open_printer(self._printer_name, winspool.PRINTER_ACCESS_USE)
         try:
             self.devmode, self._devmode_buf = winspool.build_job_devmode(
-                self._handle, self._printer_name, self._apply
+                probe, self._printer_name, self._apply
+            )
+            self.unapplied = devmode_mod.unapplied_settings(
+                self.devmode.contents, self._options
+            )
+            if self.unapplied:
+                # The driver has already had its say by this point, so this is
+                # the difference between "we asked" and "it will happen".
+                logger.warning(
+                    "%s did not accept: %s",
+                    self._printer_name, ", ".join(self.unapplied),
+                )
+        finally:
+            winspool.close_printer(probe)
+
+        try:
+            self._handle = winspool.open_printer(
+                self._printer_name, winspool.PRINTER_ACCESS_USE, devmode=self.devmode
             )
         except BaseException:
             self._close()
@@ -119,6 +153,10 @@ class PrinterSession:
     def handle(self):
         return self._handle
 
+    @property
+    def printer_name(self) -> str:
+        return self._printer_name
+
     def _close(self) -> None:
         self.devmode = None
         self._devmode_buf = None
@@ -127,21 +165,13 @@ class PrinterSession:
             self._handle = None
 
     def _apply(self, dm: winspool.DEVMODEW) -> None:
-        opts = self._options
-        dm.dmColor = winspool.DMCOLOR_COLOR if opts.color else winspool.DMCOLOR_MONOCHROME
-        if opts.paper.upper() == "A4":
-            dm.dmPaperSize = winspool.DMPAPER_A4
-        # dmCopies is the ONLY place copies are applied. print_text must not
-        # also loop its pages, or the two multiply: an earlier version did
-        # both, so 3 copies of a 2-page file emitted 18 pages.
-        dm.dmCopies = max(1, opts.copies)
-        dm.dmDuplex = winspool.DMDUP_VERTICAL if opts.duplex else winspool.DMDUP_SIMPLEX
-        # dmFields is the trap: a field written above without its bit set here
-        # is silently ignored by the driver. OR in, never overwrite, so bits
-        # the driver already set for fields we do not touch survive.
-        dm.dmFields |= (
-            winspool.DM_COLOR | winspool.DM_PAPERSIZE | winspool.DM_COPIES | winspool.DM_DUPLEX
-        )
+        """Write this job's options into the driver's devmode.
+
+        The logic lives in devmode.apply_print_options so it can be tested
+        without ctypes or a printer. See that module for why every field needs
+        its dmFields bit.
+        """
+        devmode_mod.apply_print_options(dm, self._options)
 
 
 def paginate_text(text: str) -> list[str]:
@@ -372,7 +402,16 @@ class JobQueue:
             jf.detail = decision.reason
             return
         try:
-            if decision.route == PrintRoute.RAW_TEXT:
+            if decision.route == PrintRoute.RENDERED:
+                job_id = self._print_rendered(src, job, jf, session)
+                if job_id and not self._wait_for_job_id(job.options.printer, job_id):
+                    logger.info(
+                        "%s is still on %s's queue %.0fs after spooling; "
+                        "not waiting further (the job may simply be large)",
+                        src.name, job.options.printer, JOB_APPEAR_TIMEOUT,
+                    )
+            elif decision.route == PrintRoute.RAW_TEXT:
+                jf.settings = "applied"
                 job_id = print_text(src, session)
                 if not self._wait_for_job_id(job.options.printer, job_id):
                     # Still queued at the deadline is not a failure: the job
@@ -388,6 +427,12 @@ class JobQueue:
                         src.name, job.options.printer, JOB_APPEAR_TIMEOUT,
                     )
             else:
+                jf.settings = "ignored"
+                jf.settings_detail = (
+                    "printed by the program Windows associates with this file "
+                    "type, which uses this printer's own Windows defaults for "
+                    "colour, copies and duplex"
+                )
                 queue_before = self._enum_job_ids(job.options.printer)
                 print_via_shell(src, job.options)
                 if not self._wait_for_shell_job(job.options.printer, src.name, queue_before):
@@ -396,11 +441,47 @@ class JobQueue:
                         f"ever reached the spooler within {JOB_APPEAR_TIMEOUT:.0f}s -- the handler "
                         "may be stuck on a dialog (e.g. a first-run prompt) rather than printing"
                     )
+            if jf.settings == "applied" and getattr(session, "unapplied", None):
+                jf.settings = "partial"
+                jf.settings_detail = (
+                    "this printer did not accept: " + ", ".join(session.unapplied)
+                )
             jf.status = "done"
         except (PrintError, winspool.WinspoolError, OSError) as exc:
             jf.status = "error"
             jf.detail = str(exc)
             logger.warning("print failed for %s: %s", jf.name, exc)
+
+    def _print_rendered(self, src: Path, job: "Job", jf: JobFile, session) -> int:
+        """Render and print `src` ourselves, falling back to the shell.
+
+        The fallback matters for PDFs: an encrypted or damaged file that pdfium
+        refuses may still print perfectly through the program the user already
+        has registered for it. Printing it without our settings beats not
+        printing it at all, so long as we say which happened.
+        """
+        from py_printer_server import render
+
+        try:
+            job_id = render.print_rendered(src, session, job.options.color)
+            jf.settings = "applied"
+            return job_id
+        except render.RenderError as exc:
+            logger.warning("falling back to the shell handler for %s: %s", src.name, exc)
+            jf.settings = "ignored"
+            jf.settings_detail = (
+                f"could not be rendered here ({exc}), so it was handed to the "
+                "program Windows associates with it, which uses this printer's "
+                "own Windows defaults"
+            )
+            queue_before = self._enum_job_ids(job.options.printer)
+            print_via_shell(src, job.options)
+            if not self._wait_for_shell_job(job.options.printer, src.name, queue_before):
+                raise PrintError(
+                    f"{src.name} could not be rendered and its shell handler "
+                    "produced no print job"
+                ) from exc
+            return 0
 
     def _wait_for_shell_job(self, printer: str, doc_name: str, ids_before: set[int]) -> bool:
         """Best-effort wait for a shell-launched job to reach, then drain from,

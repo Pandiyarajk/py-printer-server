@@ -4,10 +4,22 @@ build-backend = "hatchling.build"
 
 [project]
 name = "py-printer-server"
-version = "0.4.0"
-description = "Remote print server for a USB-connected printer. No third-party dependencies."
+version = "0.5.0"
+description = "Remote print server for a USB-connected printer. Colour, copies and duplex are applied per job."
 readme = "README.md"
 requires-python = ">=3.11"
+# Two dependencies, both required, both added for one reason: per-job colour
+# control is impossible without rendering pages ourselves. Handing a file to
+# Windows' own handler (the previous approach) cannot carry a devmode, so every
+# print setting was silently discarded.
+#   Pillow    >=10.3 is a security floor, not a feature one: this server decodes
+#             images uploaded from phones, and 10.2/10.3 fixed decoder CVEs.
+#   pypdfium2 renders PDF pages; ships an ABI-independent Windows wheel and has
+#             no runtime dependencies of its own.
+dependencies = [
+    "Pillow>=10.3",
+    "pypdfium2>=4.30,<6",
+]
 authors = [{ name = "Pandiyaraj Karuppasamy", email = "pandiyarajk@live.com" }]
 license = "MIT"
 license-files = ["LICENSE"]

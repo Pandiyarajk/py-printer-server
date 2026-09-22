@@ -3,10 +3,8 @@
 [![PyPI](https://img.shields.io/pypi/v/py-printer-server)](https://pypi.org/project/py-printer-server/)
 [![Python versions](https://img.shields.io/pypi/pyversions/py-printer-server)](https://pypi.org/project/py-printer-server/)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
-[![Dependencies: none](https://img.shields.io/badge/dependencies-none-brightgreen)](pyproject.toml)
 
-Remote print server for a USB-connected printer. Python 3.11+, no third-party
-dependencies. Runs on the machine your printer is plugged into; phones and
+Remote print server for a USB-connected printer. Python 3.11+. Runs on the machine your printer is plugged into; phones and
 laptops on the same network upload files to it and print them.
 
 > **Disclaimer.** Provided **AS IS**, without warranty of any kind, express or
@@ -86,24 +84,31 @@ checkbox reveals software sinks like Microsoft Print to PDF).
 
 | Type | Path |
 |---|---|
-| Plain text / code (`.txt .log .csv .md .py .json ...`) | Printed directly by this tool -- full control over colour, copies and duplex. |
-| PDF and images (`.pdf .png .jpg .tif .bmp .gif`) | Handed to Windows' registered handler for that file type via the shell's print verb. |
+| Plain text / code (`.txt .log .csv .md .py .json ...`) | Printed directly by this tool. Full control over colour, copies and duplex. |
+| PDF and images (`.pdf .png .jpg .tif .bmp .gif`) | Rendered and printed by this tool. Full control over colour, copies and duplex. |
 | Office documents (`.docx .xlsx .pptx .doc .xls .ppt`) | Same shell handoff, via Word/Excel/PowerPoint. |
 
-**Colour, copies and duplex apply fully only to the text path.** PDFs, images
-and Office documents are printed by whichever application Windows has
-associated with them, and that application builds its own print settings, so
-those files follow the printer's standing defaults instead. This is a real
-limitation of printing without a bundled renderer, not a bug.
+**Colour, copies and duplex apply to text, images and PDFs**, which this server
+renders and prints itself. Office documents are still handed to Word, Excel or
+PowerPoint, which build their own print settings, so those follow the printer's
+standing Windows defaults. The jobs list says which you got for each file.
 
-## No third-party dependencies
+Until 0.5.0 these settings applied to *nothing*: the server built the right
+settings and then never attached them to the print job, so everything came out
+at the printer's own defaults. If you set this printer's Windows default to
+mono as a workaround, you can set it back.
 
-Everything, including Win32 printer access, uses only the Python standard
-library (`ctypes` bindings to `winspool.drv`/`shell32.dll`, `http.server`,
-`socketserver`). This is a deliberate choice, matching the companion project
-[py-file-server](https://pypi.org/project/py-file-server/): fewer things that
-can go missing or need a security update on a machine you may not touch again
-for a year.
+## Dependencies
+
+Two, both required: **Pillow** and **pypdfium2**, for decoding images and
+rendering PDF pages. They exist for one reason: per-job colour control is
+impossible without rendering pages ourselves, because handing a file to
+Windows' own handler cannot carry print settings.
+
+Everything else is still standard library, deliberately: Win32 access is
+hand-written `ctypes` against `winspool.drv`/`gdi32`/`shell32`, and the HTTP
+server, LAN discovery, mDNS and QR code are all stdlib. `pywin32` in particular
+stays rejected, since `winspool.py` already does that job.
 
 ## Finding the server from an app
 

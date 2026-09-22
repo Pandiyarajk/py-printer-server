@@ -1325,10 +1325,9 @@ th {{ color: var(--text-muted); font-weight: 600; font-size: 12px; text-transfor
         <button id="print-btn">Print selected</button>
         <button id="print-all-btn">Print all</button>
     </div>
-    <div class="status-line">Colour/copies/duplex apply to plain text files only. PDFs, images and Office
-        documents are handed to their own program to print and follow that printer's own default settings
-        instead -- change those in Windows' Printing Preferences for this printer if they print in colour
-        when you don't want them to.</div>
+    <div class="status-line">Colour, copies and duplex apply to text files, images and PDFs, which this
+        server prints itself. Office documents are handed to Word/Excel/PowerPoint and follow this
+        printer's own Windows defaults instead. The jobs list shows which you got for each file.</div>
     <div class="status-line" id="print-status">Last updated: never</div>
 
     <div class="jobs-panel panel">

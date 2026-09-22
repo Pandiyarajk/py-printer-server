@@ -188,3 +188,51 @@ class TestWaitForShellJob:
         monkeypatch.setattr(printing, "JOB_APPEAR_TIMEOUT", 1.0)
         q = self._queue(tmp_path, [{5}, {9}])
         assert q._wait_for_shell_job("Test Printer", "a.pdf", set()) is True
+
+
+class TestDevmodeReachesThePrinter:
+    """The test that would have caught the reported bug.
+
+    `_apply` was always correct, so every assertion about dmColor's value
+    passed while the server printed everything in colour: the devmode it built
+    was stored on the session and handed to nothing. OpenPrinterW kept getting
+    pDevMode=NULL, and a devmode that reaches neither a printer handle nor a
+    device context has no effect whatsoever.
+
+    So this asserts the wiring, not the values.
+    """
+
+    def test_session_reopens_the_handle_carrying_the_devmode(self, monkeypatch):
+        from py_printer_server import printing, winspool
+
+        class FakeDevmodePointer:
+            """Stands in for POINTER(DEVMODEW); .contents is what the session
+            reads to check what the driver accepted."""
+
+            contents = object()
+
+        sentinel = FakeDevmodePointer()
+        opened_with: list = []
+
+        def fake_open(name, access=winspool.PRINTER_ACCESS_USE, devmode=None):
+            opened_with.append(devmode)
+            return "handle"
+
+        monkeypatch.setattr(winspool, "open_printer", fake_open)
+        monkeypatch.setattr(
+            winspool, "build_job_devmode", lambda h, n, mutate: (sentinel, b"")
+        )
+        monkeypatch.setattr(winspool, "close_printer", lambda h: None)
+        monkeypatch.setattr(
+            printing.devmode_mod, "unapplied_settings", lambda dm, o: []
+        )
+
+        options = printing.PrintOptions(printer="Fake", color=False)
+        with printing.PrinterSession("Fake", options) as session:
+            assert session.devmode is sentinel
+
+        # Probe open first (no devmode available yet), then the real one WITH it.
+        assert opened_with == [None, sentinel], (
+            "the printing handle must be opened carrying the devmode; "
+            f"got {opened_with}"
+        )

@@ -1,6 +1,6 @@
 """Round-trip tests for qrcode_ascii.py.
 
-There is no decoder library in this zero-dependency project (and none is
+There is no QR decoder library in this project (and none is
 being added just to test with), so these tests decode the encoder's own
 output independently: re-deriving version and mask from the matrix itself
 rather than trusting the encoder's internal state, then RS-verifying every

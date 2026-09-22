@@ -17,16 +17,16 @@ def test_text_extension_routes_raw_text(tmp_path: Path) -> None:
     assert route(f).route == PrintRoute.RAW_TEXT
 
 
-def test_pdf_routes_shell_verb(tmp_path: Path) -> None:
+def test_pdf_routes_rendered(tmp_path: Path) -> None:
     f = tmp_path / "doc.pdf"
     f.write_bytes(b"%PDF-1.4\n")
-    assert route(f).route == PrintRoute.SHELL_VERB
+    assert route(f).route == PrintRoute.RENDERED
 
 
-def test_image_routes_shell_verb(tmp_path: Path) -> None:
+def test_image_routes_rendered(tmp_path: Path) -> None:
     f = tmp_path / "photo.jpg"
     f.write_bytes(b"\xff\xd8\xff")
-    assert route(f).route == PrintRoute.SHELL_VERB
+    assert route(f).route == PrintRoute.RENDERED
 
 
 def test_docx_routes_office_com(tmp_path: Path) -> None:
@@ -62,4 +62,4 @@ def test_no_extension_binary_is_unsupported(tmp_path: Path) -> None:
 def test_case_insensitive_extension(tmp_path: Path) -> None:
     f = tmp_path / "PHOTO.JPG"
     f.write_bytes(b"\xff\xd8\xff")
-    assert route(f).route == PrintRoute.SHELL_VERB
+    assert route(f).route == PrintRoute.RENDERED
