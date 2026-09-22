@@ -31,5 +31,6 @@ include = [
     "README.md",
     "LICENSE",
     "DISCLAIMER.md",
+    "PROTOCOL.md",
     "pyproject.toml",
 ]
