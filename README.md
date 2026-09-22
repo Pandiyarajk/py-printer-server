@@ -54,6 +54,12 @@ open that from a phone on the same Wi-Fi, log in, and upload a file.
 --list-printers      List installed printers (hardware vs virtual) and exit
 --dry-run            Log what would be printed instead of sending jobs to a printer
 --generate-password  Print a strong random ADMIN_PASSWORD suggestion and exit
+--no-qr              Do not print a QR code for the LAN URL on startup
+--no-discovery       Do not answer UDP discovery probes from companion apps
+--discovery-port     UDP port for discovery (default: 8114)
+--mdns               Also advertise over mDNS (visible to every device on the LAN)
+--mdns-name NAME     Instance name to advertise over mDNS (default: this hostname)
+--discover           Probe the network for print servers, then exit
 ```
 
 ## How it works
@@ -99,6 +105,75 @@ library (`ctypes` bindings to `winspool.drv`/`shell32.dll`, `http.server`,
 can go missing or need a security update on a machine you may not touch again
 for a year.
 
+## Finding the server from an app
+
+Typing `http://192.168.1.24:8114` gets old once DHCP moves the address, so the
+server answers a discovery probe on **UDP 8114** and replies with the URL it is
+reachable on. A companion Android app broadcasts a probe and opens the answer in
+a WebView.
+
+The beacon is gated on a shared secret derived from `ADMIN_PASSWORD`, the same
+password that logs into the web UI. **A probe without a valid signature gets no
+reply at all**, so the server does not announce itself to a port scanner, and an
+app has to be told the password before it can find anything.
+
+Try it without an app, from any machine on the network that has the package
+installed and the same `ADMIN_PASSWORD` set:
+
+```powershell
+py-printer-server --discover
+```
+
+```
+Probing UDP 8114 for print servers sharing this ADMIN_PASSWORD...
+  OFFICE-PC                http://192.168.1.24:8114  (v0.2.0)
+```
+
+The discovery port is deliberately **independent of `--port`**. A client has to
+be able to find a server whatever HTTP port it was started on, so the beacon
+stays on 8114 and the reply carries the real port.
+
+The wire format is specified in [PROTOCOL.md](PROTOCOL.md), in enough detail to
+implement a client without reading the Python.
+
+### Windows Firewall
+
+This is the first thing to check when the web UI works from a phone but an app
+finds nothing. The prompt Windows showed on first run covered **TCP**; the UDP
+responder usually has no rule at all, and no prompt appears when the server runs
+without an interactive desktop session.
+
+In an **elevated** PowerShell:
+
+```powershell
+New-NetFirewallRule -DisplayName "py-printer-server discovery" `
+  -Direction Inbound -Protocol UDP -LocalPort 8114 -Action Allow -Profile Private
+```
+
+That rule only applies on a **Private** network. Windows classifies new networks
+as Public, where inbound is blocked wholesale, so check and fix the profile too:
+
+```powershell
+Get-NetConnectionProfile
+Set-NetConnectionProfile -InterfaceAlias "Wi-Fi" -NetworkCategory Private
+```
+
+Other reasons a probe finds nothing: a different `ADMIN_PASSWORD` (silence is by
+design), client isolation on a guest Wi-Fi network (which blocks all traffic
+between devices, so the web UI will not load either), or a VPN on the phone.
+
+### mDNS
+
+`--mdns` additionally advertises `_pyprint._tcp` so Android's `NsdManager` and
+generic DNS-SD browsers can see the server.
+
+It is **off by default and it is not gated**. An mDNS advertisement is an
+unauthenticated broadcast by nature, so turning it on makes this machine visible
+to everything on the network. The advertisement is kept minimal (service type,
+hostname, port, and a `path=/` TXT record; no printer name, version or user), and
+the startup banner says so whenever it is enabled. It needs inbound UDP 5353
+through the firewall as well.
+
 ## Security
 
 - The server refuses to start unless `ADMIN_PASSWORD` is set.
@@ -106,6 +181,12 @@ for a year.
 - Sessions use `HttpOnly`, `SameSite=Strict` cookies with CSRF tokens on every
   state-changing request.
 - Windows-only: printer access is unavailable on any other OS.
+- Discovery probes must be signed with a key derived from `ADMIN_PASSWORD`
+  (PBKDF2-HMAC-SHA256); an unsigned or wrongly signed probe is answered with
+  silence, not an error.
+- Traffic is plain HTTP. Discovery is authenticated, but the login POST and
+  the session cookie still cross the LAN in the clear, so treat this as a
+  tool for a network you trust.
 
 ## License
 

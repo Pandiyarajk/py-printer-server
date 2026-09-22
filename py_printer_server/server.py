@@ -32,6 +32,7 @@ from pathlib import Path
 from urllib.parse import parse_qs, unquote, urlparse
 
 from py_printer_server.config import Config
+from py_printer_server.discovery_net import DISCOVERY_PORT, local_ip_for
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -128,6 +129,34 @@ def _parse_args():
         "--no-qr", action="store_true",
         help="Do not print a QR code for the LAN URL on startup",
     )
+    parser.add_argument(
+        "--no-discovery", action="store_true",
+        help="Do not answer UDP discovery probes from companion apps",
+    )
+    parser.add_argument(
+        "--discovery-port", type=int, default=DISCOVERY_PORT,
+        help=(
+            f"UDP port for discovery (default: {DISCOVERY_PORT}). This is "
+            "deliberately independent of --port: a client has to be able to "
+            "find a server whatever HTTP port it was started on"
+        ),
+    )
+    parser.add_argument(
+        "--mdns", action="store_true",
+        help=(
+            "Also advertise over mDNS. Unlike the UDP beacon this carries no "
+            "secret and cannot be gated, so it makes this server visible to "
+            "every device on the network"
+        ),
+    )
+    parser.add_argument(
+        "--mdns-name", default=None,
+        help="Instance name to advertise over mDNS (default: this hostname)",
+    )
+    parser.add_argument(
+        "--discover", action="store_true",
+        help="Probe the network for print servers sharing this ADMIN_PASSWORD, and exit",
+    )
     return parser.parse_args()
 
 # ---------------------------------------------------------------------------
@@ -179,16 +208,12 @@ def lan_url(port: int) -> str:
     the local hostname is not used because it returns 127.0.0.1 on a
     surprising number of Windows configurations, which would print a URL a
     phone cannot reach.
+
+    The route lookup itself lives in discovery_net.local_ip_for, because the
+    beacon needs the same answer aimed at a specific peer rather than at a
+    public address.
     """
-    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    try:
-        s.connect(("8.8.8.8", 80))
-        ip = s.getsockname()[0]
-    except OSError:
-        ip = "127.0.0.1"
-    finally:
-        s.close()
-    return f"http://{ip}:{port}"
+    return f"http://{local_ip_for()}:{port}"
 
 # ---------------------------------------------------------------------------
 # Session store  (in-memory, thread-safe)
@@ -404,7 +429,13 @@ class Handler(http.server.SimpleHTTPRequestHandler):
         self.end_headers()
 
     def _session_cookie_header(self, token: str) -> str:
-        return f"session={token}; Path=/; HttpOnly; SameSite=Strict"
+        # Max-Age matches SESSION_TTL. Without it this is a session cookie,
+        # which Android's WebView drops on a cold process start, so the phone
+        # would have to log in again on almost every launch.
+        return (
+            f"session={token}; Path=/; Max-Age={SESSION_TTL}; "
+            "HttpOnly; SameSite=Strict"
+        )
 
     def _expire_session_cookie(self) -> str:
         return "session=; Path=/; HttpOnly; SameSite=Strict; Expires=Thu, 01 Jan 1970 00:00:00 GMT"
@@ -1533,6 +1564,73 @@ def _print_qr(url: str) -> None:
         print(render_ascii(matrix))
 
 
+def _discovery_off(args) -> str:
+    return "disabled (--no-discovery)" if args.no_discovery else "disabled"
+
+
+def _start_responder(args):
+    """Start the UDP beacon, or return None having said why not.
+
+    Deliberately not fatal, unlike the TCP bind: serving pages is the product
+    and discovery is only an accelerant, so a busy UDP port must not stop the
+    server from starting.
+    """
+    from py_printer_server import __version__
+    from py_printer_server.discovery_net import DiscoveryResponder
+
+    try:
+        responder = DiscoveryResponder(
+            password=_admin_password(),
+            http_port=PORT,
+            version=__version__,
+            bind_port=args.discovery_port,
+        )
+    except OSError as exc:
+        print(f"Discovery: disabled -- cannot bind UDP {args.discovery_port}: {exc}")
+        return None
+    responder.start()
+    return responder
+
+
+def _start_mdns(args):
+    """Start the mDNS advertiser, or return None having said why not."""
+    from py_printer_server.discovery_net import MdnsAdvertiser
+
+    try:
+        advertiser = MdnsAdvertiser(
+            instance=args.mdns_name or socket.gethostname(),
+            http_port=PORT,
+        )
+    except OSError as exc:
+        print(f"mDNS: disabled -- cannot bind UDP 5353: {exc}")
+        return None
+    advertiser.start()
+    return advertiser
+
+
+def _run_discover(port: int) -> int:
+    """Act as a client: probe the LAN and print what answers.
+
+    This is the same code path the Android client reimplements, so it doubles
+    as the way to prove the beacon works before involving a phone.
+    """
+    from py_printer_server.discovery_net import discover
+
+    print(f"Probing UDP {port} for print servers sharing this ADMIN_PASSWORD...")
+    servers = discover(_admin_password(), port=port)
+    if not servers:
+        print(
+            "No servers answered. A server with a different ADMIN_PASSWORD "
+            "stays silent by design, so check: same password, inbound UDP "
+            "allowed through the firewall, network profile set to Private, "
+            "and no client isolation on this Wi-Fi."
+        )
+        return 1
+    for srv in sorted(servers, key=lambda s: s.ip):
+        print(f"  {srv.name:<24} {srv.url}  (v{srv.ver})")
+    return 0
+
+
 def main() -> int:
     global PORT, SPOOL_DIR, JOBS_DIR, job_queue
 
@@ -1571,6 +1669,9 @@ def main() -> int:
         )
         return 1
 
+    if args.discover:
+        return _run_discover(args.discovery_port)
+
     try:
         os.makedirs(SPOOL_DIR, exist_ok=True)
         os.makedirs(JOBS_DIR, exist_ok=True)
@@ -1592,11 +1693,20 @@ def main() -> int:
         return 1
 
     with httpd:
+        # Started before the banner so their status joins it. Both bind in
+        # __init__, so a busy port is reported here rather than swallowed
+        # inside a thread.
+        responder = None if args.no_discovery else _start_responder(args)
+        mdns = _start_mdns(args) if args.mdns else None
+
         url = lan_url(PORT)
         print(f"Print Server: http://localhost:{PORT}")
         print(f"From another device on this network: {url}")
         if not args.no_qr:
             _print_qr(url)
+        print(f"Discovery: {responder.status if responder else _discovery_off(args)}")
+        if mdns:
+            print(f"mDNS: {mdns.status}")
         if args.dry_run:
             print("DRY RUN: jobs will be logged, not sent to a printer.")
         try:
@@ -1605,6 +1715,10 @@ def main() -> int:
             print("\nShutting down.")
         finally:
             httpd.shutdown()
+            if mdns:
+                mdns.stop()
+            if responder:
+                responder.stop()
     return 0
 
 

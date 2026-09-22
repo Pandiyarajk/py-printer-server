@@ -52,6 +52,31 @@ Remote print server for a USB-connected printer. This repo follows the
   in its embedded CSS/JS must be doubled. A stray single brace raises at
   request time, not import time, so the UI 500s while unit tests still pass.
   `tests/test_server.py` renders both templates to catch this.
+- **The discovery wire format is frozen.** `py_printer_server/discovery.py` and
+  `PROTOCOL.md` are the contract with the Android client in
+  `D:/GitHub/android-printer-client`. The shared test vectors in
+  `tests/test_discovery.py` are asserted on both sides, so if they fail you have
+  changed the wire format and every installed app has stopped finding this
+  server. Bump `v` rather than editing a field.
+- **The beacon signs with PBKDF2, not the raw password as an HMAC key.** Every
+  probe on the wire is a (message, tag) pair under the same secret that logs
+  into the web UI, so one captured datagram is an offline cracking oracle.
+  200k iterations makes that expensive; it looks like over-engineering only
+  until you notice what the key is.
+- **The reply's IP comes from a per-peer route lookup**
+  (`discovery_net.local_ip_for(peer)`), not from `lan_url()`. On a machine with
+  a VPN or a second NIC, the default-route address is not the one a phone on
+  Wi-Fi can reach, and reporting it hands the app a URL that cannot load.
+- **The discovery port does not follow `--port`.** It is fixed at 8114 so a
+  client can find a server whatever HTTP port it was started on; the reply
+  carries the real port. Making it track `--port` would make discovery
+  impossible to bootstrap.
+- **A rejected probe gets silence, never an error.** A scanner, a client with
+  the wrong password, and a replayer must all be unable to tell their cases
+  apart. Rejection reasons go to the DEBUG log only.
+- **mDNS (`--mdns`) is off by default and cannot be gated**, unlike the beacon.
+  It is an unauthenticated advertisement by design, which is why it is opt-in
+  and why the banner says so every time it is on.
 - The full design rationale, trade-offs (no PDF rendering, no per-job
   duplex/colour control for Office files, why SumatraPDF and pywin32 were
   rejected) is in the plan file this repo was built from:
