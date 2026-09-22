@@ -50,14 +50,23 @@ BACKUP_COUNT = 5
 # make the server buffer arbitrary memory.
 SMALL_BODY_LIMIT = 1024 * 1024
 
-SESSION_TTL = 8 * 3600
+# A year. This is a home or small office tool reached from a phone, and an
+# 8-hour session meant logging in again almost every time the app was opened,
+# which pushed people towards a weak, memorable password. A long session is the
+# safer end of that trade, but only because it is revocable: sessions are bound
+# to the current password (see _password_fingerprint), so changing
+# ADMIN_PASSWORD invalidates every one of them everywhere, and /logout drops
+# the one on this device.
+SESSION_TTL = 365 * 24 * 3600
 MAX_FAILURES = 5
 LOCKOUT_SECONDS = 300
 
 ADMIN_PASSWORD_ENV = "ADMIN_PASSWORD"
 
 # The server's own files, which live in the spool dir but are not uploads.
-_HIDDEN_SPOOL_NAMES = frozenset({"config.json"})
+# sessions.json holds live session tokens, so leaving it out of this set
+# would list it in the UI and serve it on request.
+_HIDDEN_SPOOL_NAMES = frozenset({"config.json", "sessions.json"})
 
 # Reserved DOS device names: opening one of these resolves to a device rather
 # than a file in the spool, regardless of the directory.
@@ -222,11 +231,103 @@ def lan_url(port: int) -> str:
 _sessions_lock = threading.Lock()
 _sessions: dict[str, dict] = {}
 
+# Where sessions are kept across restarts. Set in main() once the spool exists;
+# while it is None the store stays purely in memory, which is what the tests use.
+SESSIONS_FILE: str | None = None
+
+
+def _password_fingerprint() -> str:
+    """A short, non-reversible marker for the password a session was issued under.
+
+    This is what makes a year-long session safe to offer. Every stored session
+    records the fingerprint of the password in force when it was created, and a
+    session whose fingerprint no longer matches is refused. So changing
+    ADMIN_PASSWORD signs every device out immediately, everywhere, without
+    needing to reach any of them.
+
+    Not a password hash for authentication: it never leaves the machine and is
+    only ever compared against itself. It is salted and truncated so the stored
+    file does not become an offline cracking target of its own.
+    """
+    import hashlib
+
+    digest = hashlib.sha256(
+        b"py-printer-server/session-binding/v1" + _admin_password().encode("utf-8")
+    ).hexdigest()
+    return digest[:16]
+
 
 def _prune_sessions() -> None:
+    """Drop expired sessions, and any issued under a different password.
+
+    Caller must hold _sessions_lock.
+    """
     now = time.time()
-    for t in [t for t, v in _sessions.items() if v["expires"] < now]:
+    try:
+        fingerprint = _password_fingerprint()
+    except Exception:
+        fingerprint = None
+    for t in [
+        t
+        for t, v in _sessions.items()
+        if v["expires"] < now
+        or (fingerprint is not None and v.get("pw") not in (None, fingerprint))
+    ]:
         del _sessions[t]
+
+
+def _save_sessions() -> None:
+    """Persist the session table. Caller must hold _sessions_lock.
+
+    Without this a 365-day cookie would be a lie: the browser would keep
+    presenting a token the server forgot the moment it restarted, and the user
+    would be bounced to the login page anyway.
+
+    Written 0600 where the platform honours it, and always inside the spool dir,
+    which is excluded from the file listing.
+    """
+    if not SESSIONS_FILE:
+        return
+    try:
+        tmp = SESSIONS_FILE + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(_sessions, f)
+        os.replace(tmp, SESSIONS_FILE)
+        try:
+            os.chmod(SESSIONS_FILE, 0o600)
+        except OSError:
+            pass
+    except OSError as exc:
+        logger.warning("could not save sessions: %s", exc)
+
+
+def load_sessions() -> None:
+    """Restore sessions at startup, dropping anything stale or foreign."""
+    if not SESSIONS_FILE or not os.path.exists(SESSIONS_FILE):
+        return
+    try:
+        with open(SESSIONS_FILE, encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, ValueError) as exc:
+        logger.warning("could not read sessions, starting empty: %s", exc)
+        return
+    if not isinstance(data, dict):
+        return
+    with _sessions_lock:
+        _sessions.clear()
+        for token, value in data.items():
+            if (
+                isinstance(token, str)
+                and isinstance(value, dict)
+                and isinstance(value.get("expires"), (int, float))
+                and isinstance(value.get("csrf"), str)
+            ):
+                _sessions[token] = value
+        before = len(_sessions)
+        _prune_sessions()
+        dropped = before - len(_sessions)
+    if dropped:
+        logger.info("dropped %d expired or superseded session(s)", dropped)
 
 
 def session_create() -> tuple[str, str]:
@@ -234,23 +335,36 @@ def session_create() -> tuple[str, str]:
     csrf = secrets.token_hex(24)
     with _sessions_lock:
         _prune_sessions()
-        _sessions[token] = {"expires": time.time() + SESSION_TTL, "csrf": csrf}
+        _sessions[token] = {
+            "expires": time.time() + SESSION_TTL,
+            "csrf": csrf,
+            "pw": _password_fingerprint(),
+        }
+        _save_sessions()
     return token, csrf
 
 
 def session_get(token: str) -> dict | None:
     with _sessions_lock:
         s = _sessions.get(token)
-        if s and s["expires"] >= time.time():
-            return s
-        if s:
+        if s is None:
+            return None
+        stale = s["expires"] < time.time()
+        try:
+            foreign = s.get("pw") not in (None, _password_fingerprint())
+        except Exception:
+            foreign = False
+        if stale or foreign:
             del _sessions[token]
-    return None
+            _save_sessions()
+            return None
+        return s
 
 
 def session_delete(token: str) -> None:
     with _sessions_lock:
-        _sessions.pop(token, None)
+        if _sessions.pop(token, None) is not None:
+            _save_sessions()
 
 # ---------------------------------------------------------------------------
 # Login rate limiter  (per IP, in-memory)
@@ -1158,6 +1272,7 @@ th, td {{ padding: 8px; text-align: left; border-bottom: 1px solid var(--border)
 th {{ color: var(--text-muted); font-weight: 600; font-size: 12px; text-transform: uppercase; }}
 .empty-notice {{ text-align: center; color: var(--text-muted); padding: 24px; }}
 .btn-small {{ background: none; border: 1px solid var(--border); border-radius: 6px; padding: 4px 8px; cursor: pointer; color: var(--text); }}
+.nav-link a.logout {{ float: right; }}
 .select-bar {{ display: flex; gap: 8px; margin-bottom: 10px; flex-wrap: wrap; }}
 .select-bar button {{ background: var(--surface2); border: 1px solid var(--border); border-radius: 6px; padding: 6px 10px; cursor: pointer; color: var(--text); font-size: 13px; }}
 .print-bar {{ position: sticky; bottom: 0; background: var(--surface); border: 1px solid var(--border); border-radius: 14px; padding: 14px; display: flex; gap: 10px; flex-wrap: wrap; align-items: center; }}
@@ -1177,7 +1292,10 @@ th {{ color: var(--text-muted); font-weight: 600; font-size: 12px; text-transfor
 <body>
 <div class="wrap">
     <h1>🖨️ Print Server</h1>
-    <div class="nav-link"><a href="/archive">📁 Archived jobs</a></div>
+    <div class="nav-link">
+        <a href="/archive">📁 Archived jobs</a>
+        <a href="/logout" class="logout">🔓 Log out</a>
+    </div>
 
     <div class="panel">
         <div class="drop" id="drop">Drag &amp; drop files here to add them to the print spool</div>
@@ -1450,6 +1568,7 @@ th, td {{ padding: 8px; text-align: left; border-bottom: 1px solid var(--border)
 th {{ color: var(--text-muted); font-weight: 600; font-size: 12px; text-transform: uppercase; }}
 .empty-notice {{ text-align: center; color: var(--text-muted); padding: 24px; }}
 .btn-small {{ background: none; border: 1px solid var(--border); border-radius: 6px; padding: 4px 8px; cursor: pointer; color: var(--text); }}
+.nav-link a.logout {{ float: right; }}
 .select-bar {{ display: flex; gap: 8px; margin-bottom: 10px; flex-wrap: wrap; }}
 .select-bar button {{ background: var(--surface2); border: 1px solid var(--border); border-radius: 6px; padding: 6px 10px; cursor: pointer; color: var(--text); font-size: 13px; }}
 .action-bar {{ display: flex; gap: 10px; margin-top: 14px; flex-wrap: wrap; align-items: center; }}
@@ -1462,7 +1581,10 @@ th {{ color: var(--text-muted); font-weight: 600; font-size: 12px; text-transfor
 <body>
 <div class="wrap">
     <h1>📁 Archived Jobs</h1>
-    <div class="nav-link"><a href="/">← Back to Print Server</a></div>
+    <div class="nav-link">
+        <a href="/">← Back to Print Server</a>
+        <a href="/logout" class="logout">🔓 Log out</a>
+    </div>
 
     <div class="panel">
         <div class="select-bar">
@@ -1632,7 +1754,7 @@ def _run_discover(port: int) -> int:
 
 
 def main() -> int:
-    global PORT, SPOOL_DIR, JOBS_DIR, job_queue
+    global PORT, SPOOL_DIR, JOBS_DIR, job_queue, SESSIONS_FILE
 
     if sys.stdout.encoding and sys.stdout.encoding.lower() != "utf-8":
         try:
@@ -1682,6 +1804,10 @@ def main() -> int:
     _attach_file_logging(SPOOL_DIR)
     Config.set_config_file(os.path.join(SPOOL_DIR, "config.json"))
     Config.load()
+
+    # Sessions outlive the process, so a year-long login survives a restart.
+    SESSIONS_FILE = os.path.join(SPOOL_DIR, "sessions.json")
+    load_sessions()
 
     from py_printer_server.printing import JobQueue
     job_queue = JobQueue(Path(JOBS_DIR), dry_run=args.dry_run)

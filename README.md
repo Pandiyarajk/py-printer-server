@@ -178,6 +178,13 @@ through the firewall as well.
 
 - The server refuses to start unless `ADMIN_PASSWORD` is set.
 - Login attempts are rate-limited (5 failures locks an IP out for 5 minutes).
+- A login lasts a year and survives a server restart, so a phone does not have
+  to log in again every day. It is revocable two ways: **Log out** on any page
+  ends that device's session, and **changing `ADMIN_PASSWORD` signs out every
+  device everywhere**, because each session records which password issued it.
+- Session tokens live in `sessions.json` inside the spool folder. That file is
+  hidden from the file listing and never served. Treat it as a credential:
+  anyone who can read it can act as you until the password changes.
 - Sessions use `HttpOnly`, `SameSite=Strict` cookies with CSRF tokens on every
   state-changing request.
 - Windows-only: printer access is unavailable on any other OS.

@@ -77,6 +77,12 @@ Remote print server for a USB-connected printer. This repo follows the
 - **mDNS (`--mdns`) is off by default and cannot be gated**, unlike the beacon.
   It is an unauthenticated advertisement by design, which is why it is opt-in
   and why the banner says so every time it is on.
+- **A year-long session is only defensible because it is revocable.** Every
+  session records a fingerprint of the password that issued it, so changing
+  `ADMIN_PASSWORD` invalidates all of them without reaching any device. If you
+  ever drop that binding, drop `SESSION_TTL` back to hours in the same commit.
+- **`sessions.json` must stay in `_HIDDEN_SPOOL_NAMES`.** It lives in the spool
+  folder and holds live tokens; listing it would also make it downloadable.
 - The full design rationale, trade-offs (no PDF rendering, no per-job
   duplex/colour control for Office files, why SumatraPDF and pywin32 were
   rejected) is in the plan file this repo was built from:

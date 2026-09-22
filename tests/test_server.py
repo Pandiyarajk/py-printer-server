@@ -130,3 +130,99 @@ class TestTranslateJobDir:
         assert self._translate("") is None
         assert self._translate(".") is None
         assert self._translate("..") is None
+
+
+class TestSessionPersistence:
+    """Sessions survive a restart, and a password change ends them.
+
+    A 365-day cookie is only defensible because it is revocable: without the
+    password binding below, changing ADMIN_PASSWORD would leave every phone that
+    ever logged in still holding a working token for a year.
+    """
+
+    def _fresh(self, monkeypatch, tmp_path, password="pw-one"):
+        from py_printer_server import server as srv
+        monkeypatch.setenv(srv.ADMIN_PASSWORD_ENV, password)
+        monkeypatch.setattr(srv, "SESSIONS_FILE", str(tmp_path / "sessions.json"))
+        srv._sessions.clear()
+        return srv.session_create()
+
+    def test_session_round_trips(self, monkeypatch, tmp_path):
+        from py_printer_server import server as srv
+        token, csrf = self._fresh(monkeypatch, tmp_path)
+        got = srv.session_get(token)
+        assert got is not None
+        assert got["csrf"] == csrf
+
+    def test_ttl_is_a_year(self):
+        from py_printer_server import server as srv
+        assert srv.SESSION_TTL == 365 * 24 * 3600
+
+    def test_cookie_carries_max_age(self, monkeypatch, tmp_path):
+        from py_printer_server import server as srv
+        token, _ = self._fresh(monkeypatch, tmp_path)
+        header = srv.Handler._session_cookie_header(
+            object.__new__(srv.Handler), token
+        )
+        assert f"Max-Age={srv.SESSION_TTL}" in header
+        assert "HttpOnly" in header
+        assert "SameSite=Strict" in header
+
+    def test_survives_a_restart(self, monkeypatch, tmp_path):
+        from py_printer_server import server as srv
+        token, _ = self._fresh(monkeypatch, tmp_path)
+        # Simulate the process going away and coming back.
+        srv._sessions.clear()
+        srv.load_sessions()
+        assert srv.session_get(token) is not None
+
+    def test_password_change_invalidates_every_session(self, monkeypatch, tmp_path):
+        from py_printer_server import server as srv
+        token, _ = self._fresh(monkeypatch, tmp_path, password="pw-one")
+        assert srv.session_get(token) is not None
+        monkeypatch.setenv(srv.ADMIN_PASSWORD_ENV, "pw-two")
+        assert srv.session_get(token) is None
+
+    def test_password_change_invalidates_across_a_restart(self, monkeypatch, tmp_path):
+        from py_printer_server import server as srv
+        token, _ = self._fresh(monkeypatch, tmp_path, password="pw-one")
+        monkeypatch.setenv(srv.ADMIN_PASSWORD_ENV, "pw-two")
+        srv._sessions.clear()
+        srv.load_sessions()
+        assert srv.session_get(token) is None
+
+    def test_logout_deletes_the_session_from_disk(self, monkeypatch, tmp_path):
+        from py_printer_server import server as srv
+        token, _ = self._fresh(monkeypatch, tmp_path)
+        srv.session_delete(token)
+        srv._sessions.clear()
+        srv.load_sessions()
+        assert srv.session_get(token) is None
+
+    def test_expired_session_is_refused(self, monkeypatch, tmp_path):
+        import time
+
+        from py_printer_server import server as srv
+        token, _ = self._fresh(monkeypatch, tmp_path)
+        srv._sessions[token]["expires"] = time.time() - 1
+        assert srv.session_get(token) is None
+
+    def test_session_file_is_hidden_from_the_spool_listing(self):
+        from py_printer_server import server as srv
+        # It holds live tokens. Listing it would also make it downloadable.
+        assert "sessions.json" in srv._HIDDEN_SPOOL_NAMES
+
+    def test_corrupt_session_file_does_not_break_startup(self, monkeypatch, tmp_path):
+        from py_printer_server import server as srv
+        monkeypatch.setenv(srv.ADMIN_PASSWORD_ENV, "pw-one")
+        path = tmp_path / "sessions.json"
+        path.write_text("{not json at all", encoding="utf-8")
+        monkeypatch.setattr(srv, "SESSIONS_FILE", str(path))
+        srv._sessions.clear()
+        srv.load_sessions()          # must not raise
+        assert srv._sessions == {}
+
+    def test_logout_link_is_on_both_pages(self):
+        from py_printer_server import server as srv
+        for template in (srv._MAIN_PAGE_TEMPLATE, srv._ARCHIVE_PAGE_TEMPLATE):
+            assert 'href="/logout"' in template
